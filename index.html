@@ -506,6 +506,40 @@ addEventListener("resize", resize);
 
 const COL = { bg:"#0d0906", wood:"#241812", wood2:"#2c1d15", body:"#120e0b", text:"#e8dcd0", fire:"#ff7a1a", core:"#ffd08a" };
 
+// 炎のゆらぎ。部屋全体の明るさがこれに同期する＝火が本当の光源に見える
+// 決定的なので、全端末で同じ瞬間に同じだけ揺れる
+let Flick = 1;
+const flickerOf = t => {
+  const F = frameOf(t);
+  return 0.88 + 0.12 * (0.62 * noise(F / 6) + 0.38 * noise(F / 14));
+};
+
+// フィルムの粒子。平坦なベクター感を消す。タイルを1枚だけ作って敷き詰める
+let grainTile = null;
+function drawGrain(t){
+  if (!grainTile){
+    const n = 128;
+    grainTile = document.createElement("canvas");
+    grainTile.width = grainTile.height = n;
+    const gg = grainTile.getContext("2d");
+    const img = gg.createImageData(n, n);
+    for (let i = 0; i < n * n; i++){
+      const v = 118 + Math.floor(unit("gr" + i) * 74);
+      img.data[i * 4] = img.data[i * 4 + 1] = img.data[i * 4 + 2] = v;
+      img.data[i * 4 + 3] = 255;
+    }
+    gg.putImageData(img, 0, 0);
+  }
+  const step = Math.floor(frameOf(t) / 4);
+  const ox = -(step * 37) % 128, oy = -(step * 61) % 128;
+  g.save();
+  g.globalAlpha = 0.045;
+  g.globalCompositeOperation = "overlay";
+  for (let x = ox; x < W; x += 128)
+    for (let y = oy; y < H; y += 128) g.drawImage(grainTile, x, y);
+  g.restore();
+}
+
 function rr(x, y, w, h, r){
   g.beginPath();
   r = Math.min(r, w / 2, h / 2);
@@ -525,11 +559,20 @@ function drawRoom(doorGlow){
   cg.addColorStop(0, "rgba(0,0,0,0.55)"); cg.addColorStop(1, "rgba(0,0,0,0)");
   g.fillStyle = cg; g.fillRect(0, 0, W, ceil * 1.6);
 
-  // 壁は横張り。板の上端に光、下端に影を置くと厚みが出る
+  // 壁は横張り。板の上端に光、下端に影を置くと厚みが出る。板ごとに木目を散らす
   const post = W * 0.055;
+  let bi = 0;
   for (let y = ceil; y < H * 0.72; y += 15){
-    g.fillStyle = "rgba(255,196,140,0.045)"; g.fillRect(post, y, W - post * 2, 1);
-    g.fillStyle = "rgba(0,0,0,0.20)";        g.fillRect(post, y + 1, W - post * 2, 1.5);
+    const shine = (0.030 + unit("bd" + bi) * 0.030) * Flick;
+    g.fillStyle = "rgba(255,196,140," + shine.toFixed(3) + ")"; g.fillRect(post, y, W - post * 2, 1);
+    g.fillStyle = "rgba(0,0,0,0.20)"; g.fillRect(post, y + 1, W - post * 2, 1.5);
+    for (let k = 0; k < 3; k++){                                  // 木目
+      const gx = post + (W - post * 2) * unit("gx" + bi + "_" + k);
+      const gw2 = 18 + unit("gw" + bi + "_" + k) * 52;
+      g.fillStyle = "rgba(0,0,0,0.11)";
+      g.fillRect(gx, y + 4 + unit("gy" + bi + "_" + k) * 7, gw2, 1);
+    }
+    bi++;
   }
   // 角の柱。部屋の箱が締まる
   for (const px of [0, W - post]){
@@ -603,7 +646,7 @@ function drawRoom(doorGlow){
       const t2 = (gy - y) / top, hx = hb + (hf - hb) * t2;
       g.fillStyle = "rgba(0,0,0,0.10)"; g.fillRect(cx - hx, gy, hx * 2, 0.8);
     }
-    g.fillStyle = "rgba(255,214,164," + (0.10 + depth * 0.09).toFixed(3) + ")"; // 角の光
+    g.fillStyle = "rgba(255,214,164," + ((0.10 + depth * 0.09) * Flick).toFixed(3) + ")"; // 角の光
     g.fillRect(cx - hb, y, hb * 2, 1.2);
   }
 }
@@ -779,8 +822,11 @@ function drawPerson(x, y, s, id, alpha, isMe, heat, slump, stam, jolt){
   const j = clamp(jolt === undefined ? 0 : jolt, 0, 1);
   // 熱いと前に屈み、体力が尽きてくるとさらに沈む＝数字を見なくても限界が分かる
   // jolt はロウリュを食らった瞬間のすくみ。上段の人ほど大きく縮む＝当たったのが見える
+  // 姿勢は人ごとに違える。同じ人形が並ぶと一気に嘘っぽくなる
+  const pose = unit("ps" + id);                        // 0.62超＝背をあずけて座る人
+  const leanBack = pose > 0.62;
   const hunch = hot * 0.20 + spent * 0.26 + j * 0.34 + (slump ? 0.52 : 0)
-              + unit("po" + id) * 0.10;              // 姿勢は人ごとに少し違う
+              + unit("po" + id) * 0.10 - (leanBack ? 0.16 : 0);
   const hipY  = y - U * 0.015 + br * U * 0.004;
   const torso = U * (0.44 - hunch * 0.13);
   const shldY = hipY - torso;
@@ -799,7 +845,7 @@ function drawPerson(x, y, s, id, alpha, isMe, heat, slump, stam, jolt){
   const dist = Math.hypot(dxl, dyl) || 1;
   const ux = dxl / dist, uy = dyl / dist;
   const fall = clamp(1 - (dist / (Math.max(W, H) * 0.62)), 0.34, 1);   // 遠いほど暗い（沈み切らせない）
-  const lit = 0.50 + 0.40 * fall + hot * 0.12;
+  const lit = (0.50 + 0.40 * fall + hot * 0.12) * Flick;               // 炎のゆらぎに同期
 
   // 火だけの部屋では人は影絵になる。中は暗く保ち、火に向いた縁だけを立てる
   const shade = (a, b) => {
@@ -873,15 +919,19 @@ function drawPerson(x, y, s, id, alpha, isMe, heat, slump, stam, jolt){
   g.lineTo(px - hipW * 0.50, hipY + U * 0.015);
   g.closePath(); g.fill();
 
-  // 腕。肩から膝へ
+  // 腕。膝に置く人と、後ろに手をついて背をあずける人がいる
   g.fillStyle = body;
   g.lineJoin = "round"; g.lineCap = "round";
-  g.strokeStyle = body; g.lineWidth = U * 0.115;
+  g.strokeStyle = body; g.lineWidth = U * 0.095;
   for (const sgn of [-1, 1]){
     g.beginPath();
     g.moveTo(px + sgn * shldW * 0.42, shldY + hr * 0.46);
-    g.quadraticCurveTo(px + sgn * shldW * 0.60, shldY + torso * 0.62,
-                       px + sgn * hipW * 0.40, hipY - U * 0.02);
+    if (leanBack)
+      g.quadraticCurveTo(px + sgn * shldW * 0.86, shldY + torso * 0.55,
+                         px + sgn * hipW * 0.88, hipY - U * 0.01);
+    else
+      g.quadraticCurveTo(px + sgn * shldW * 0.62, shldY + torso * 0.66,
+                         px + sgn * hipW * 0.42, hipY - U * 0.02);
     g.stroke();
   }
 
@@ -1333,6 +1383,7 @@ const App = {
 
     const temp = temperature(alive.length, now, this.events);
     const hell = clamp((temp - 90) / 14, 0, 1);
+    Flick = flickerOf(now);                                    // 炎のゆらぎ。部屋全体がこれに従う
 
     // 予兆の進行。誰かが打った直後だけ 0→1 になる
     const sinceP = now - this.pressedAt;
@@ -1351,13 +1402,25 @@ const App = {
     }
     // ロウリュが降りた直後のすくみ。段ごとに大きさが違う＝誰に当たったかが見える
     const recoil = clamp(1 - (now - this.roomLoyly) / 480, 0, 1);
-    const order = alive.slice().sort((a, b) => (Seats.map[a.id] ?? 0) - (Seats.map[b.id] ?? 0));
-    for (const p of order){
-      const s = Seats.list[Seats.map[p.id]]; if (!s) continue;
-      const mine = p.id === me;
-      const lk = mine ? {heat: Me.dHeat, stam: Me.dStam} : lookOf(p.id, p.heat, p.stam, dt);
-      drawPerson(s.x, s.y, s.s, p.id, 1, mine, lk.heat, false, lk.stam,
-                 recoil * (loylyBite(s.tier, Seats.tiers) / 1.8));
+    // 奥の段から描き、段ごとに空気の膜をかぶせる＝距離が出る
+    for (let r = 0; r < Seats.tiers; r++){
+      for (const p of alive){
+        const s = Seats.list[Seats.map[p.id]];
+        if (!s || s.tier !== r) continue;
+        const mine = p.id === me;
+        const lk = mine ? {heat: Me.dHeat, stam: Me.dStam} : lookOf(p.id, p.heat, p.stam, dt);
+        drawPerson(s.x, s.y, s.s, p.id, 1, mine, lk.heat, false, lk.stam,
+                   recoil * (loylyBite(s.tier, Seats.tiers) / 1.8));
+      }
+      const remain = Seats.tiers <= 1 ? 0 : 1 - r / (Seats.tiers - 1);
+      if (remain > 0.01){
+        const yTop = Seats.tierY[r] - H * 0.10, yBot = Seats.tierY[r] + H * 0.06;
+        const veil = g.createLinearGradient(0, yTop, 0, yBot);
+        const a = (0.10 * remain).toFixed(3);
+        veil.addColorStop(0, "rgba(46,28,18," + a + ")");
+        veil.addColorStop(1, "rgba(46,28,18," + (0.16 * remain).toFixed(3) + ")");
+        g.fillStyle = veil; g.fillRect(0, yTop, W, yBot - yTop);
+      }
     }
     // 出された人は床に座り込んで見ている（部屋から消えない＝人が減らない）
     const outs = inRound.filter(p => p.out);
@@ -1381,6 +1444,7 @@ const App = {
     const canMove = rs.running && (moveDown ? Seats.freeIn(cur + 1, inRound) : true);
     drawHaze(now, hell);                                       // 熱気と陽炎
     drawVignette(hell);                                        // 人と炎の上に重ねて中央へ寄せる
+    drawGrain(now);                                            // フィルムの粒子
     if (rs.running && !Me.out)
       drawBreath(now, H * 0.705, this.disturb(now),
                  Me.played === 0 && rs.left > ROUND_MS - 12000);
