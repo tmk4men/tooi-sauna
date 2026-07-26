@@ -1,2 +1,9 @@
 # 手元だけに置くもの（戦略メモ）
 勝ち筋.md
+
+# 検証の依存
+検証/node_modules/
+検証/package.json
+検証/package-lock.json
+検証/shots/
+検証/*.png
