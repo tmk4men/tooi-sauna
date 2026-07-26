@@ -49,8 +49,10 @@ const ALWAYS_OPEN = Q.get("open") === "1";        // 開場時刻を待たずに
 const FAST        = Q.get("fast") === "1";        // 1回20秒。手触りを確かめるとき3分待たずに済む
 const OPEN_FROM   = [0, 30];                      // 毎時00分と30分から
 const OPEN_LEN    = 15;                           // 15分ぶん開く
-const ROUND_MS    = FAST ? 20000 : 180000;        // 1回は最長3分
-const GAP_MS      = FAST ? 6000 : 40000;          // 回と回の間は40秒（脱落者はここで戻る）
+// 熱がじんわりになったぶん1回を伸ばす。3分だと下段に籠るだけで必ず残れてしまう
+// 250秒＋50秒＝300秒。15分の開場にちょうど3回入る（途中で切られる回が出ない）
+const ROUND_MS    = FAST ? 30000 : 250000;        // 1回は最長4分10秒
+const GAP_MS      = FAST ? 10000 : 50000;         // 回と回の間（脱落者はここで戻る）
 const HB_MS       = 2000;
 const STALE_MS    = 7000;
 const SEAT_FADE   = 2000;
@@ -60,9 +62,9 @@ const SEAT_FADE   = 2000;
 //   体力 … 熱が高いほど速く減る。戻らない。0で出される
 //   ＝水は「延命」であって「解除」ではない。回に必ず終わりと山ができる
 const HEAT_MAX    = 100;
-const HEAT_K      = FAST ? 0.10 : 0.024;          // 落ち着き先へ近づく速さ。小さいほどじんわり
-const SURGE_TAU   = 0.45;                         // ロウリュの熱が乗り切るまでの緩み（秒）
-const BAR_TAU_H   = 0.34;                         // 表示上の熱の追従（見た目が跳ねないように）
+const HEAT_K      = FAST ? 0.055 : 0.013;         // 落ち着き先へ近づく速さ。小さいほどじんわり
+const SURGE_TAU   = 0.70;                         // ロウリュの熱が乗り切るまでの緩み（秒）
+const BAR_TAU_H   = 0.50;                         // 表示上の熱の追従（見た目が跳ねないように）
 const BAR_TAU_S   = 0.16;                         // 表示上の体力の追従
 const LOOK_TAU    = 0.50;                         // 他人の姿勢の追従（心拍は2秒おきなので滑らかにする）
 const HEAT_DROP   = 58;                           // 上段と下段の落ち着き先の差
@@ -942,17 +944,17 @@ function drawPerson(x, y, s, id, alpha, isMe, heat, slump, stam, jolt){
   g.fillStyle = shade(0.5, 0.5);
   g.beginPath(); g.ellipse(headX + tremble, headY, hr * 0.86, hr, 0, 0, 6.284); g.fill();
 
-  // 火に向いた縁だけ強く光る。汗の照り返し
+  // 火に向いた縁だけ光る。頭は広い弧にすると「笑った口」に見えるので短い縁に留める
+  const ang = Math.atan2(uy, ux);
   g.strokeStyle = "rgba(255," + Math.round(186 * fall + 40) + "," + Math.round(112 * fall + 30) + "," + (0.30 + fall * 0.34).toFixed(3) + ")";
-  g.lineWidth = Math.max(0.9, U * 0.030);
+  g.lineWidth = Math.max(0.9, U * 0.026);
   g.beginPath();
-  g.arc(headX + tremble, headY, hr * 0.90, Math.atan2(uy, ux) - 1.15, Math.atan2(uy, ux) + 1.15);
+  g.arc(headX + tremble, headY, hr * 0.96, ang - 0.52, ang + 0.30);
   g.stroke();
   g.save();
   torsoPath(); g.clip();
   g.beginPath();
-  g.arc(px + ux * shldW * 0.44, midY + uy * torso * 0.30, torso * 0.62,
-        Math.atan2(uy, ux) - 1.3, Math.atan2(uy, ux) + 1.3);
+  g.arc(px + ux * shldW * 0.44, midY + uy * torso * 0.30, torso * 0.62, ang - 1.3, ang + 1.3);
   g.lineWidth = Math.max(1.1, U * 0.045); g.stroke();
   g.restore();
 
@@ -1070,7 +1072,7 @@ function drawBreath(now, cy, disturb, hint){
   else if (hint) say("輪が重なった瞬間に、どこでも触れる", COL.text, 0.5);  // 最初の1回だけ
 }
 
-function drawControls(now, canLoyly, canMove, moveDown, running){
+function drawControls(now, canLoyly, canMove, moveDown, running, tell){
   const pad = Math.max(10, W * 0.03);
   const bw = (W - pad * 4) / 3, bh = Math.max(64, H * 0.085);
   const by = H - bh - Math.max(20, H * 0.045);
@@ -1181,6 +1183,35 @@ function drawControls(now, canLoyly, canMove, moveDown, running){
   }
   face(Btn.move, canMove && !Me.out, moveDown ? "下がる" : "上がる",
        (running && moveDown && !canMove) ? "下段は満席" : null, moveDown ? "down" : "up");
+
+  // 予兆の1.8秒だけ、対処できるボタンを縁取って明滅させる
+  // 危険信号はストーブ側に出るのに操作は最下部なので、ここを繋がないと反応が間に合わない
+  if (tell > 0){
+    const puls = 0.45 + 0.55 * Math.abs(Math.sin(now / 150));
+    for (const b of [Btn.water, Btn.move]){
+      if (!b) continue;
+      const usable = (b === Btn.water) ? (Me.water > 0) : canMove;
+      if (!usable || Me.out) continue;
+      g.strokeStyle = "rgba(255,244,226," + (0.30 + puls * 0.55).toFixed(3) + ")";
+      g.lineWidth = 2.2; rr(b.x - 2, b.y - 2, b.w + 4, b.h + 4, 13); g.stroke();
+    }
+  }
+}
+
+// 予兆の間、ストーブから手元へ光を降ろして視線を繋ぐ
+function drawTellGuide(tell){
+  if (tell <= 0 || !Btn.water) return;
+  const from = {x: W / 2, y: H * 0.78};
+  const to = {x: W / 2, y: Btn.water.y - 6};
+  const gr = g.createLinearGradient(from.x, from.y, to.x, to.y);
+  gr.addColorStop(0, "rgba(255,240,214," + (0.16 * tell).toFixed(3) + ")");
+  gr.addColorStop(1, "rgba(255,240,214,0)");
+  g.fillStyle = gr;
+  const halfTop = W * 0.10, halfBot = W * 0.44;
+  g.beginPath();
+  g.moveTo(from.x - halfTop, from.y); g.lineTo(from.x + halfTop, from.y);
+  g.lineTo(to.x + halfBot, to.y); g.lineTo(to.x - halfBot, to.y);
+  g.closePath(); g.fill();
 }
 
 function drawTop(aliveCount, temp, rs, hell){
@@ -1448,8 +1479,9 @@ const App = {
     if (rs.running && !Me.out)
       drawBreath(now, H * 0.705, this.disturb(now),
                  Me.played === 0 && rs.left > ROUND_MS - 12000);
+    drawTellGuide(tell);                                       // 危険信号と手元を繋ぐ
     drawTop(alive.length, temp, rs, hell);
-    drawControls(now, canLoyly, canMove, moveDown, rs.running);
+    drawControls(now, canLoyly, canMove, moveDown, rs.running, tell);
 
     if (!rs.running){                                          // 回の間
       g.fillStyle = "rgba(8,6,5,0.55)"; g.fillRect(0, 0, W, H);
