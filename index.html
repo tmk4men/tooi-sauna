@@ -563,21 +563,69 @@ function drawRoom(doorGlow){
     g.fillStyle = sp; g.fillRect(0, 0, W, H * 0.74);
   }
 
-  // 段。天面・前面・スラット・影で厚い板に見せる
-  for (let i = 0; i < Seats.tierY.length; i++){
-    const y = Seats.tierY[i] + 2, bh = Seats.benchH, top = 5;
-    g.fillStyle = "rgba(0,0,0,0.30)"; g.fillRect(-10, y + bh, W + 20, 5);      // 落ち影
-    const fg = g.createLinearGradient(0, y + top, 0, y + bh);                   // 前面
-    fg.addColorStop(0, i % 2 ? "#33231a" : "#2c1e16");
-    fg.addColorStop(1, "#1a110c");
-    g.fillStyle = fg; g.fillRect(-10, y + top, W + 20, bh - top);
-    for (let x = post; x < W; x += 26){                                        // スラットの継ぎ目
-      g.fillStyle = "rgba(0,0,0,0.22)"; g.fillRect(x, y + top, 1.5, bh - top);
+  // 段。奥は狭く手前は広い台形にして、天面が見えるようにする＝部屋の奥行きが出る
+  const cx = W / 2, tiers = Seats.tierY.length;
+  for (let i = 0; i < tiers; i++){
+    const depth = tiers === 1 ? 1 : i / (tiers - 1);       // 0=奥 1=手前
+    const y = Seats.tierY[i] + 2, bh = Seats.benchH, top = 7 + depth * 5;
+    const hb = W * (0.34 + 0.20 * depth), hf = hb + W * 0.035;
+    const dim = 0.55 + depth * 0.45;                       // 奥は空気に沈む
+
+    g.fillStyle = "rgba(0,0,0,0.34)";                      // 落ち影
+    g.beginPath();
+    g.moveTo(cx - hf, y + top + bh); g.lineTo(cx + hf, y + top + bh);
+    g.lineTo(cx + hf + 6, y + top + bh + 7); g.lineTo(cx - hf - 6, y + top + bh + 7);
+    g.closePath(); g.fill();
+
+    const fg = g.createLinearGradient(0, y + top, 0, y + top + bh);            // 前面
+    fg.addColorStop(0, "rgba(" + Math.round(58 * dim) + "," + Math.round(40 * dim) + "," + Math.round(28 * dim) + ",1)");
+    fg.addColorStop(1, "rgba(" + Math.round(22 * dim) + "," + Math.round(15 * dim) + "," + Math.round(10 * dim) + ",1)");
+    g.fillStyle = fg;
+    g.beginPath();
+    g.moveTo(cx - hf, y + top); g.lineTo(cx + hf, y + top);
+    g.lineTo(cx + hf, y + top + bh); g.lineTo(cx - hf, y + top + bh);
+    g.closePath(); g.fill();
+    for (let k = -7; k <= 7; k++){                                             // スラットの継ぎ目
+      const sx = cx + k * (hf / 7.2);
+      g.fillStyle = "rgba(0,0,0,0.26)"; g.fillRect(sx, y + top, 1.5, bh);
     }
-    const tg = g.createLinearGradient(0, y, 0, y + top);                        // 天面
-    tg.addColorStop(0, "#4a3527"); tg.addColorStop(1, "#31221a");
-    g.fillStyle = tg; g.fillRect(-10, y, W + 20, top);
-    g.fillStyle = "rgba(255,206,152,0.13)"; g.fillRect(-10, y, W + 20, 1.2);   // 角の光
+
+    const tg = g.createLinearGradient(0, y, 0, y + top);                       // 天面
+    tg.addColorStop(0, "rgba(" + Math.round(96 * dim) + "," + Math.round(68 * dim) + "," + Math.round(48 * dim) + ",1)");
+    tg.addColorStop(1, "rgba(" + Math.round(52 * dim) + "," + Math.round(36 * dim) + "," + Math.round(25 * dim) + ",1)");
+    g.fillStyle = tg;
+    g.beginPath();
+    g.moveTo(cx - hb, y); g.lineTo(cx + hb, y);
+    g.lineTo(cx + hf, y + top); g.lineTo(cx - hf, y + top);
+    g.closePath(); g.fill();
+    for (let k = 0; k < 5; k++){                                               // 天面の木目
+      const gy = y + top * (0.2 + k * 0.17);
+      const t2 = (gy - y) / top, hx = hb + (hf - hb) * t2;
+      g.fillStyle = "rgba(0,0,0,0.10)"; g.fillRect(cx - hx, gy, hx * 2, 0.8);
+    }
+    g.fillStyle = "rgba(255,214,164," + (0.10 + depth * 0.09).toFixed(3) + ")"; // 角の光
+    g.fillRect(cx - hb, y, hb * 2, 1.2);
+  }
+}
+
+// 熱気。うっすら層になって漂う＋ストーブの真上は陽炎で歪む
+function drawHaze(t, hell){
+  const F = frameOf(t);
+  for (let i = 0; i < 3; i++){
+    const y = H * (0.30 + i * 0.17) + Math.sin(F / 90 + i * 2.1) * 8;
+    const hz = g.createLinearGradient(0, y - H * 0.09, 0, y + H * 0.09);
+    hz.addColorStop(0, "rgba(255,190,140,0)");
+    hz.addColorStop(0.5, "rgba(255,190,140," + (0.020 + hell * 0.022).toFixed(3) + ")");
+    hz.addColorStop(1, "rgba(255,190,140,0)");
+    g.fillStyle = hz; g.fillRect(0, y - H * 0.09, W, H * 0.18);
+  }
+  const cx = W / 2, base = H * 0.82;                       // 陽炎
+  for (let i = 0; i < 7; i++){
+    const p = i / 7;
+    const yy = base - H * 0.10 - p * H * 0.30;
+    const off = Math.sin(F / 26 + i * 1.7) * (4 + p * 9);
+    g.fillStyle = "rgba(255,206,150," + ((1 - p) * (0.045 + hell * 0.03)).toFixed(3) + ")";
+    g.fillRect(cx - W * 0.16 + off, yy, W * 0.32, 2.2);
   }
 }
 
@@ -727,87 +775,160 @@ function drawPerson(x, y, s, id, alpha, isMe, heat, slump, stam, jolt){
   const spent = 1 - clamp((stam === undefined ? STAM_MAX : stam) / STAM_MAX, 0, 1);
   const rate = 1 - hot * 0.45;                                    // 熱いと呼吸が浅く速い
   const br = Math.sin((t / 1000) * (6.283 / (per * rate)) + ph);
-  const U = 46 * s;                                    // 座高を基準に組む
+  const U = 62 * s;                                    // 座った全高を基準に組む
   const j = clamp(jolt === undefined ? 0 : jolt, 0, 1);
   // 熱いと前に屈み、体力が尽きてくるとさらに沈む＝数字を見なくても限界が分かる
   // jolt はロウリュを食らった瞬間のすくみ。上段の人ほど大きく縮む＝当たったのが見える
   const hunch = hot * 0.20 + spent * 0.26 + j * 0.34 + (slump ? 0.52 : 0)
               + unit("po" + id) * 0.10;              // 姿勢は人ごとに少し違う
-  const hipY  = y - U * 0.04 + br * U * 0.006;
-  const torso = U * (0.50 - hunch * 0.16);
+  const hipY  = y - U * 0.015 + br * U * 0.004;
+  const torso = U * (0.44 - hunch * 0.13);
   const shldY = hipY - torso;
-  const hr    = U * 0.185;
-  const headX = x + hunch * U * 0.24;
-  const headY = shldY - hr * 0.95 + hunch * U * 0.16;
-  const shldW = U * (0.60 + br * 0.010), hipW = U * 0.50;
+  const hr    = U * 0.125;                             // 頭は小さく。ここを外すと人形になる
+  const neck  = U * 0.055;
+  const headX = x + hunch * U * 0.20;
+  const headY = shldY - neck - hr + hunch * U * 0.13;
+  const shldW = U * (0.42 + br * 0.008), hipW = U * 0.34;
 
   g.globalAlpha = alpha;
-  if (isMe){                                           // 自分の席は足元にうっすら光
-    const fg = g.createRadialGradient(x, y + 2, 1, x, y + 2, U * 0.62);
-    fg.addColorStop(0, "rgba(255,170,90,0.22)"); fg.addColorStop(1, "rgba(255,170,90,0)");
-    g.fillStyle = fg; g.fillRect(x - U * 0.7, y - U * 0.3, U * 1.4, U * 0.7);
-  }
 
-  // 限界が近い人は輪郭が揺れる＝「あいつはもう出る」が読める
-  const dying = spent > 0.70 && !slump;
-  const flick = dying ? 0.20 * Math.sin(t / 90 + unit("f" + id) * 6.283) : 0;
-  const line = "rgba(255," + (dying ? 128 : 170) + ",90," + (0.40 + hot * 0.28 + flick).toFixed(3) + ")";
-  const lw = Math.max(1, 1.25 * s);
+  // 光源はストーブだけ。体の「火に向いた側」が明るく、反対側は闇に落ちる
+  const LX = W / 2, LY = H * 0.80;
+  const midY = shldY + torso * 0.5;
+  const dxl = LX - x, dyl = LY - midY;
+  const dist = Math.hypot(dxl, dyl) || 1;
+  const ux = dxl / dist, uy = dyl / dist;
+  const fall = clamp(1 - (dist / (Math.max(W, H) * 0.62)), 0.34, 1);   // 遠いほど暗い（沈み切らせない）
+  const lit = 0.50 + 0.40 * fall + hot * 0.12;
 
-  g.lineCap = "round";
-  g.strokeStyle = line; g.lineWidth = lw * 1.9;        // 脛。段に腰かけて前へ垂れる
-  for (const sgn of [-1, 1]){
-    g.beginPath();
-    g.moveTo(x + sgn * hipW * 0.30, hipY);
-    g.lineTo(x + sgn * hipW * 0.34, y + U * 0.30);
-    g.stroke();
-  }
-
-  const torsoPath = () => {                            // 胴。肩から腰へ細くなる
-    g.beginPath();
-    g.moveTo(x - shldW / 2, shldY + hr * 0.30);
-    g.quadraticCurveTo(x, shldY - hr * 0.10, x + shldW / 2, shldY + hr * 0.30);
-    g.lineTo(x + hipW / 2, hipY);
-    g.quadraticCurveTo(x, hipY + U * 0.06, x - hipW / 2, hipY);
-    g.closePath();
+  // 火だけの部屋では人は影絵になる。中は暗く保ち、火に向いた縁だけを立てる
+  const shade = (a, b) => {
+    const gr = g.createLinearGradient(x - ux * U * a, midY - uy * U * a,
+                                      x + ux * U * b, midY + uy * U * b);
+    gr.addColorStop(0, "rgba(7,5,4,1)");
+    gr.addColorStop(0.62, "rgba(" + Math.round(30 * lit) + "," + Math.round(18 * lit) + "," + Math.round(12 * lit) + ",1)");
+    gr.addColorStop(1, "rgba(" + Math.round(118 * lit) + "," + Math.round(68 * lit) + "," + Math.round(38 * lit) + ",1)");
+    return gr;
   };
-  g.fillStyle = COL.body; torsoPath(); g.fill();
-  const rim = g.createLinearGradient(0, hipY, 0, shldY);
-  rim.addColorStop(0, "rgba(255,150,70,0.20)"); rim.addColorStop(1, "rgba(255,150,70,0)");
-  g.fillStyle = rim; torsoPath(); g.fill();
-  g.strokeStyle = line; g.lineWidth = lw; torsoPath(); g.stroke();
+  const body = shade(0.52, 0.52);
 
-  g.lineWidth = lw * 1.5;                              // 腕。膝に置く
+  // 段に落ちる影。火と反対側へ伸びる
+  g.fillStyle = "rgba(0,0,0,0.38)";
+  g.beginPath();
+  g.ellipse(x - ux * U * 0.30, y + U * 0.05, U * 0.42, U * 0.10, 0, 0, 6.284);
+  g.fill();
+
+  const tremble = (spent > 0.70 && !slump) ? Math.sin(t / 55 + unit("f" + id) * 6.283) * U * 0.012 : 0;
+  const px = x + tremble;
+
+  // 脚。腿から脛までひと続きにする（分けると椅子の脚に見える）
+  // 明暗は脚の位置で取り直す。胴の勾配を流用すると脚だけ光って棒に見える
+  const legShade = (() => {
+    const ly = y + U * 0.12;
+    const gr = g.createLinearGradient(px - ux * U * 0.42, ly - uy * U * 0.42,
+                                      px + ux * U * 0.42, ly + uy * U * 0.42);
+    const k = lit * 0.72;
+    gr.addColorStop(0, "rgba(6,4,4,1)");
+    gr.addColorStop(0.6, "rgba(" + Math.round(26 * k) + "," + Math.round(16 * k) + "," + Math.round(11 * k) + ",1)");
+    gr.addColorStop(1, "rgba(" + Math.round(92 * k) + "," + Math.round(54 * k) + "," + Math.round(31 * k) + ",1)");
+    return gr;
+  })();
+  g.lineJoin = "round"; g.lineCap = "round";
+  g.fillStyle = legShade; g.strokeStyle = legShade;
   for (const sgn of [-1, 1]){
+    g.lineWidth = U * 0.135;                           // 腿
     g.beginPath();
-    g.moveTo(x + sgn * shldW * 0.44, shldY + hr * 0.42);
-    g.quadraticCurveTo(x + sgn * shldW * 0.62, shldY + torso * 0.55,
-                       x + sgn * hipW * 0.36, hipY + U * 0.02);
+    g.moveTo(px + sgn * hipW * 0.22, hipY - U * 0.02);
+    g.lineTo(px + sgn * hipW * 0.46, y + U * 0.045);
+    g.stroke();
+    g.lineWidth = U * 0.105;                           // 脛
+    g.beginPath();
+    g.moveTo(px + sgn * hipW * 0.46, y + U * 0.035);
+    g.lineTo(px + sgn * hipW * 0.50, y + U * 0.30);
     g.stroke();
   }
-
-  g.lineWidth = lw * 1.6;                              // 首
-  g.beginPath(); g.moveTo(x, shldY + hr * 0.10); g.lineTo(headX, headY + hr * 0.75); g.stroke();
   g.lineCap = "butt";
 
-  const headPath = () => { g.beginPath(); g.ellipse(headX, headY, hr * 0.92, hr, 0, 0, 6.284); };
-  g.fillStyle = COL.body; headPath(); g.fill();
-  g.strokeStyle = line; g.lineWidth = lw; headPath(); g.stroke();
+  // 胴
+  const torsoPath = () => {
+    g.beginPath();
+    g.moveTo(px - shldW / 2, shldY + hr * 0.34);
+    g.quadraticCurveTo(px, shldY - hr * 0.22, px + shldW / 2, shldY + hr * 0.34);
+    g.quadraticCurveTo(px + hipW * 0.60, hipY - torso * 0.34, px + hipW * 0.54, hipY);
+    g.lineTo(px - hipW * 0.54, hipY);
+    g.quadraticCurveTo(px - hipW * 0.60, hipY - torso * 0.34, px - shldW / 2, shldY + hr * 0.34);
+    g.closePath();
+  };
+  g.fillStyle = body; torsoPath(); g.fill();
 
-  // サウナハット。3人に2人はかぶっている＝一目でサウナに見える
+  // 腰のタオル。布なので照り返しは弱く、幅は腰までに収める
+  const tw = g.createLinearGradient(px - ux * U * 0.4, 0, px + ux * U * 0.4, 0);
+  tw.addColorStop(0, "rgba(" + Math.round(26 * lit) + "," + Math.round(24 * lit) + "," + Math.round(21 * lit) + ",1)");
+  tw.addColorStop(1, "rgba(" + Math.round(146 * lit) + "," + Math.round(133 * lit) + "," + Math.round(116 * lit) + ",1)");
+  g.fillStyle = tw;
+  g.beginPath();
+  g.moveTo(px - hipW * 0.52, hipY - U * 0.055);
+  g.lineTo(px + hipW * 0.52, hipY - U * 0.055);
+  g.lineTo(px + hipW * 0.50, hipY + U * 0.015);
+  g.lineTo(px - hipW * 0.50, hipY + U * 0.015);
+  g.closePath(); g.fill();
+
+  // 腕。肩から膝へ
+  g.fillStyle = body;
+  g.lineJoin = "round"; g.lineCap = "round";
+  g.strokeStyle = body; g.lineWidth = U * 0.115;
+  for (const sgn of [-1, 1]){
+    g.beginPath();
+    g.moveTo(px + sgn * shldW * 0.42, shldY + hr * 0.46);
+    g.quadraticCurveTo(px + sgn * shldW * 0.60, shldY + torso * 0.62,
+                       px + sgn * hipW * 0.40, hipY - U * 0.02);
+    g.stroke();
+  }
+
+  // 首と頭
+  g.lineWidth = U * 0.105;
+  g.beginPath(); g.moveTo(px, shldY + hr * 0.05); g.lineTo(headX + tremble, headY + hr * 0.70); g.stroke();
+  g.lineCap = "butt"; g.lineJoin = "miter";
+  g.fillStyle = shade(0.5, 0.5);
+  g.beginPath(); g.ellipse(headX + tremble, headY, hr * 0.86, hr, 0, 0, 6.284); g.fill();
+
+  // 火に向いた縁だけ強く光る。汗の照り返し
+  g.strokeStyle = "rgba(255," + Math.round(186 * fall + 40) + "," + Math.round(112 * fall + 30) + "," + (0.30 + fall * 0.34).toFixed(3) + ")";
+  g.lineWidth = Math.max(0.9, U * 0.030);
+  g.beginPath();
+  g.arc(headX + tremble, headY, hr * 0.90, Math.atan2(uy, ux) - 1.15, Math.atan2(uy, ux) + 1.15);
+  g.stroke();
+  g.save();
+  torsoPath(); g.clip();
+  g.beginPath();
+  g.arc(px + ux * shldW * 0.44, midY + uy * torso * 0.30, torso * 0.62,
+        Math.atan2(uy, ux) - 1.3, Math.atan2(uy, ux) + 1.3);
+  g.lineWidth = Math.max(1.1, U * 0.045); g.stroke();
+  g.restore();
+
+  // サウナハット。3人に2人はかぶっている
   if (unit("hat" + id) > 0.34){
-    const hw = hr * 1.30;
-    const cap = () => {
-      g.beginPath();
-      g.moveTo(headX - hw, headY - hr * 0.14);
-      g.quadraticCurveTo(headX, headY - hr * 2.05, headX + hw, headY - hr * 0.14);
-      g.closePath();
-    };
-    g.fillStyle = "rgba(230,216,198,0.15)"; cap(); g.fill();
-    g.strokeStyle = "rgba(238,226,210,0.44)"; g.lineWidth = lw; cap(); g.stroke();
+    const hw = hr * 1.34, hx = headX + tremble;
+    const hg = g.createLinearGradient(hx - ux * hw, 0, hx + ux * hw, 0);
+    hg.addColorStop(0, "rgba(" + Math.round(46 * lit) + "," + Math.round(42 * lit) + "," + Math.round(36 * lit) + ",1)");
+    hg.addColorStop(1, "rgba(" + Math.round(238 * lit) + "," + Math.round(224 * lit) + "," + Math.round(204 * lit) + ",1)");
+    g.fillStyle = hg;
+    g.beginPath();
+    g.moveTo(hx - hw, headY - hr * 0.10);
+    g.quadraticCurveTo(hx, headY - hr * 2.10, hx + hw, headY - hr * 0.10);
+    g.closePath(); g.fill();
     g.beginPath();                                     // つば
-    g.moveTo(headX - hw * 1.08, headY - hr * 0.10);
-    g.lineTo(headX + hw * 1.08, headY - hr * 0.10); g.stroke();
+    g.moveTo(hx - hw * 1.12, headY - hr * 0.10);
+    g.lineTo(hx + hw * 1.12, headY - hr * 0.10);
+    g.lineTo(hx + hw * 1.02, headY + hr * 0.06);
+    g.lineTo(hx - hw * 1.02, headY + hr * 0.06);
+    g.closePath(); g.fill();
+  }
+
+  if (isMe){                                           // 自分の席は足元だけうっすら
+    const fg = g.createRadialGradient(x, y + U * 0.16, 1, x, y + U * 0.16, U * 0.66);
+    fg.addColorStop(0, "rgba(255,180,100,0.20)"); fg.addColorStop(1, "rgba(255,180,100,0)");
+    g.fillStyle = fg; g.fillRect(x - U * 0.7, y - U * 0.2, U * 1.4, U * 0.8);
   }
   g.globalAlpha = 1;
 }
@@ -1258,6 +1379,7 @@ const App = {
     const cur = Seats.tierOf(me), last = Seats.tiers - 1;
     const moveDown = cur < last;
     const canMove = rs.running && (moveDown ? Seats.freeIn(cur + 1, inRound) : true);
+    drawHaze(now, hell);                                       // 熱気と陽炎
     drawVignette(hell);                                        // 人と炎の上に重ねて中央へ寄せる
     if (rs.running && !Me.out)
       drawBreath(now, H * 0.705, this.disturb(now),
