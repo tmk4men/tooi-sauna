@@ -239,12 +239,39 @@ const Net = {
   mine(){ return {t: {".sv": "timestamp"}, s: App.screen === "sauna" ? "i" : "w",
                   tier: Me.tier, heat: Math.round(Me.heat), st: Math.round(Me.stam),
                   out: Me.out ? 1 : 0, r: Me.round}; },
+  // DB が無いときの自分の記録（同じ端末の別ウィンドウへ配るのに使う）
+  mineLocal(){ return {t: serverNow(), j: this.myJoin || serverNow(),
+                       s: App.screen === "sauna" ? "i" : "w", tier: Me.tier,
+                       heat: Math.round(Me.heat), st: Math.round(Me.stam),
+                       out: Me.out ? 1 : 0, r: Me.round}; },
+
+  // サーバーを立てずに「他人がいる状態」を試すための橋。同じ端末の別ウィンドウ同士だけ繋がる
+  // 本番（複数端末）は DB を設定すること。これは確かめ専用
+  bus: null,
+  initBus(){
+    if (typeof BroadcastChannel === "undefined") return;
+    this.bus = new BroadcastChannel("tooi-sauna:" + ROOM);
+    this.bus.onmessage = e => {
+      const d = e.data;
+      if (!d) return;
+      if (d.k === "m" && d.id !== me){
+        this.members[d.id] = Object.assign(this.members[d.id] || {}, d.v);
+        this.seen = true;
+      } else if (d.k === "bye"){ delete this.members[d.id]; }
+      else if (d.k === "l"){ this.loyly[d.key] = {t: d.t}; }
+      else if (d.k === "hello" && d.id !== me){ this.say({k: "m", id: me, v: this.mineLocal()}); }
+    };
+    this.say({k: "hello", id: me});             // 先に居た人に自分を知らせてもらう
+  },
+  say(msg){ if (this.bus) try { this.bus.postMessage(msg); } catch(e){} },
 
   async join(){
     if (!this.live){
-      const n = serverNow();
-      this.members[me] = {t: n, j: n, s: "i", tier: Me.tier, heat: 0, out: 0, r: Me.round};
-      this.joined = true; this.seen = true; this.beat(); return;   // ひとりでも心拍は要る
+      this.myJoin = serverNow();
+      this.members[me] = this.mineLocal();
+      this.joined = true; this.seen = true;
+      this.initBus();                                             // 別ウィンドウと繋ぐ
+      this.beat(); return;                                        // ひとりでも心拍は要る
     }
     const t0 = Date.now();
     try {
@@ -281,7 +308,12 @@ const Net = {
   },
 
   push(){                        // 動いたら即座に伝える（心拍を待たない）
-    if (!this.live){ Object.assign(this.members[me] || {}, {tier: Me.tier, heat: Math.round(Me.heat), out: Me.out ? 1 : 0, r: Me.round, t: serverNow()}); return; }
+    if (!this.live){
+      const v = this.mineLocal();
+      this.members[me] = v;
+      this.say({k: "m", id: me, v});
+      return;
+    }
     fetch(this.url("/m/" + me + ".json"), {method: "PATCH", body: JSON.stringify(this.mine())}).catch(() => {});
   },
   // 心拍。止まると STALE_MS で「居ない人」と見なされるので、ひとりのときも打ち続ける
@@ -293,11 +325,17 @@ const Net = {
         fetch(this.url("/l/" + k + ".json"), {method: "DELETE"}).catch(() => {});
   },
   sendLoyly(){
-    if (!this.live){ this.loyly["x" + Math.random().toString(36).slice(2)] = {t: serverNow()}; return; }
+    if (!this.live){
+      const key = "x" + Math.random().toString(36).slice(2), t = serverNow();
+      this.loyly[key] = {t};
+      this.say({k: "l", key, t});                                  // 別ウィンドウにも降らせる
+      return;
+    }
     fetch(this.url("/l.json"), {method: "POST", body: JSON.stringify({t: {".sv": "timestamp"}})}).catch(() => {});
   },
   leave(){
-    if (!this.live || !this.joined) return;
+    if (!this.joined) return;
+    if (!this.live){ this.say({k: "bye", id: me}); return; }
     try { fetch(this.url("/m/" + me + ".json"), {method: "DELETE", keepalive: true}); } catch(e){}
   },
   present(){
