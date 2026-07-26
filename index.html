@@ -49,8 +49,20 @@ const STAM_MAX    = 100;
 const STAM_BASE   = STAM_MAX / (FAST ? 22 : 120); // 体力の減り。熱で倍率がかかる
 const WATER_MAX   = 3;                            // 桶は3杯
 const WATER_COOL  = -26;                          // 1杯で下がる熱
-const LOYLY_HEAT  = 18;                           // 全員に乗る熱（押した人にも乗る）
+const LOYLY_HEAT  = 18;                           // 乗る熱の基準値（段で倍率がかかる）
 const LOYLY_AFTER = 15;                           // 降りてから8秒は部屋そのものが熱い
+
+// 呼吸。これが「常にやっていること」＝行動が絶えない核
+//   輪がふくらみ切った瞬間にタップすると整う。整っている間は体力の減りが遅い
+//   ロウリュが降ると呼吸が乱れて合わせられなくなる＝他人の行動が自分の操作を邪魔する
+const BREATH_HIT   = 280;                         // 合ったと見なす前後の幅（ms）
+const BREATH_SLOW  = 2.9;                         // 下段の周期（秒）。ゆっくりで合わせやすい
+const BREATH_FAST  = 2.0;                         // 上段の周期。速くて難しい
+const CALM_GAIN    = 0.22;                        // 合ったとき
+const CALM_MISS    = 0.18;                        // 外したとき
+const CALM_LAPSE   = 0.16;                        // 1周期まるごと放置したとき
+const CALM_RELIEF  = 0.75;                        // 整っていると体力の減りが最大どれだけ緩むか
+const DISTURB_MS   = 6000;                        // ロウリュ後、呼吸が乱れている時間
 const LOYLY_ROOM  = FAST ? 4000 : 20000;          // ストーブが冷えるまで部屋の誰も打てない
 const LOYLY_SELF  = FAST ? 6000 : 40000;          // 1人あたりの間隔
 // 予兆。押した瞬間には効かない。ひしゃくの音がしてから降りてくるまでの猶予
@@ -176,6 +188,8 @@ const Audio_ = {
     this.tone(90, 40, 0.3, 0.14);
   },
   water(){ this.burst({dur:.7, f0:2400, f1:600, q:.9, vol:.22}); },
+  breathIn(){ this.tone(180, 300, 0.16, 0.09, "sine"); },      // 整った
+  breathOff(){ this.tone(150, 96, 0.14, 0.07, "triangle"); },  // 外した
   move(){ this.burst({dur:.22, f0:900, f1:400, q:1.2, vol:.10}); },
   out(){ this.tone(320, 90, 0.5, 0.18, "triangle"); this.burst({dur:.8, f0:1800, f1:400, q:.7, vol:.14}); },
   win(){ this.tone(420, 640, 0.5, 0.16, "sine"); this.tone(640, 880, 0.45, 0.10, "sine"); },
@@ -209,7 +223,7 @@ const Net = {
     if (!this.live){
       const n = serverNow();
       this.members[me] = {t: n, j: n, s: "i", tier: Me.tier, heat: 0, out: 0, r: Me.round};
-      this.joined = true; this.seen = true; return;
+      this.joined = true; this.seen = true; this.beat(); return;   // ひとりでも心拍は要る
     }
     const t0 = Date.now();
     try {
@@ -249,7 +263,8 @@ const Net = {
     if (!this.live){ Object.assign(this.members[me] || {}, {tier: Me.tier, heat: Math.round(Me.heat), out: Me.out ? 1 : 0, r: Me.round, t: serverNow()}); return; }
     fetch(this.url("/m/" + me + ".json"), {method: "PATCH", body: JSON.stringify(this.mine())}).catch(() => {});
   },
-  beat(){ setInterval(() => { if (this.live){ this.push(); this.sweep(); } }, HB_MS); },
+  // 心拍。止まると STALE_MS で「居ない人」と見なされるので、ひとりのときも打ち続ける
+  beat(){ setInterval(() => { this.push(); if (this.live) this.sweep(); }, HB_MS); },
   sweep(){
     const now = serverNow();
     for (const k in this.loyly)
@@ -284,11 +299,19 @@ addEventListener("beforeunload", () => Net.leave());
 
 const Me = {
   tier: 1, heat: 0, stam: STAM_MAX, water: WATER_MAX, out: false, round: -1, lastLoyly: 0,
+  calm: 0.5,              // 呼吸が整っている度合い
+  bPhase: 0,              // 呼吸の位相（0でふくらみ切る）
+  bCycle: 0,              // 何周期目か。1周期に判定は1回だけ
+  bJudged: -1,            // 判定済みの周期
+  bFlash: 0,              // 合った瞬間の手応え
+  bMiss: 0,               // 外した瞬間の手応え
+  survived: 0, played: 0, // 今夜の記録（この場だけ。保存しない）
   reset(r){
     this.round = r; this.heat = 0; this.stam = STAM_MAX;
     this.water = WATER_MAX; this.out = false;
     this.tier = Math.min(1, Math.max(0, Seats.tiers - 1));
-    this.lastLoyly = 0;
+    this.lastLoyly = 0; this.calm = 0.5;
+    this.bPhase = 0; this.bCycle = 0; this.bJudged = -1; this.bFlash = 0; this.bMiss = 0;
   }
 };
 
@@ -379,10 +402,21 @@ function heatEquilibrium(tier, tiers, loylyRecent){
   const d = tiers <= 1 ? 0 : (t / (tiers - 1)) * HEAT_DROP;
   return clamp(HEAT_MAX - d + (loylyRecent ? LOYLY_AFTER : 0), 0, HEAT_MAX + LOYLY_AFTER);
 }
-// 体力の減り。熱いほど速い。下段で凌ぎ切れるかは紙一重に置いてある
-function drainRate(heat){
+// 体力の減り。熱いほど速く、呼吸が整っているほど緩む（＝腕で2倍近く変わる）
+function drainRate(heat, calm){
   const h = clamp(heat / HEAT_MAX, 0, 1);
-  return STAM_BASE * (0.35 + 1.15 * Math.pow(h, 1.5));
+  const c = clamp(calm === undefined ? 0.5 : calm, 0, 1);
+  return STAM_BASE * (0.35 + 1.15 * Math.pow(h, 1.5)) * (1 + CALM_RELIEF * (0.6 - c));
+}
+// ロウリュは段で効きが変わる。上段が最も食らう＝どこに座るかが読み合いになる
+function loylyBite(tier, tiers){
+  const d = tiers <= 1 ? 0 : (tier < 0 ? 1 : tier) / (tiers - 1);
+  return 1.8 - d * 1.45;                                   // 上段1.8 → 下段0.35
+}
+// 呼吸の周期。上段は速くて合わせにくい。乱れているとさらに速くなる
+function breathPeriod(tier, tiers, disturb){
+  const d = tiers <= 1 ? 0 : (tier < 0 ? 1 : tier) / (tiers - 1);
+  return (BREATH_FAST + (BREATH_SLOW - BREATH_FAST) * d) * (1 - 0.25 * clamp(disturb, 0, 1));
 }
 
 function temperature(alive, now, events){
@@ -532,7 +566,7 @@ function drawStove(t, hell, ready, tell){
 }
 
 // 熱は数字で出さない。姿勢で見せる（前に屈む・うつむく）
-function drawPerson(x, y, s, id, alpha, isMe, heat, slump, stam){
+function drawPerson(x, y, s, id, alpha, isMe, heat, slump, stam, jolt){
   const t = serverNow();
   const per = 3.2 + unit("p" + id) * 1.9;
   const ph = unit("q" + id) * 6.283;
@@ -542,7 +576,9 @@ function drawPerson(x, y, s, id, alpha, isMe, heat, slump, stam){
   const br = Math.sin((t / 1000) * (6.283 / (per * rate)) + ph);
   const bh = 46 * s, bw = 30 * s, hr = 9.5 * s;
   // 熱いと前に屈み、体力が尽きてくるとさらに沈む＝数字を見なくても限界が分かる
-  const lean = (hot * 0.26 + spent * 0.22 + (slump ? 0.42 : 0)) * bh;
+  // jolt はロウリュを食らった瞬間のすくみ。上段の人ほど大きく縮む＝当たったのが見える
+  const j = clamp(jolt === undefined ? 0 : jolt, 0, 1);
+  const lean = (hot * 0.26 + spent * 0.22 + j * 0.30 + (slump ? 0.42 : 0)) * bh;
   const top = y - bh * (1 + br * 0.018) + lean;
 
   g.globalAlpha = alpha;
@@ -559,7 +595,10 @@ function drawPerson(x, y, s, id, alpha, isMe, heat, slump, stam){
   const rim = g.createLinearGradient(0, top + bh, 0, top + bh * 0.45);
   rim.addColorStop(0, "rgba(255,150,70,0.16)"); rim.addColorStop(1, "rgba(255,150,70,0)");
   g.fillStyle = rim; bodyPath(); g.fill();
-  g.strokeStyle = "rgba(255,168,88," + (0.34 + hot * 0.30).toFixed(3) + ")";
+  // 限界が近い人は輪郭が揺れる＝「あいつはもう出る」が読める
+  const dying = spent > 0.70 && !slump;
+  const flick = dying ? 0.18 * Math.sin(t / 90 + unit("f" + id) * 6.283) : 0;
+  g.strokeStyle = "rgba(255," + (dying ? 130 : 168) + ",88," + (0.34 + hot * 0.30 + flick).toFixed(3) + ")";
   g.lineWidth = Math.max(1, 1.2 * s);
   bodyPath(); g.stroke(); headPath(); g.stroke();
   g.globalAlpha = 1;
@@ -590,7 +629,48 @@ function drawSteam(now, events){
 
 const Btn = {loyly: null, water: null, move: null};
 
-function drawControls(now, canLoyly, canMove, moveDown, alive){
+// 呼吸の輪。ふくらみ切った瞬間にタップする。乱れているとふらつく
+function drawBreath(now, cy, disturb, hint){
+  const phase = Me.bPhase;
+  const swell = 0.5 + 0.5 * Math.cos(phase * 6.283);          // 位相0で最大
+  const wob = disturb * 5.5 * Math.sin(now / 47) ;            // 乱れ＝目印がぶれる
+  const rBase = Math.min(38, W * 0.10);
+  const r = rBase * (0.52 + 0.48 * swell) + wob;
+  const cx = Math.max(rBase + 12, W * 0.20);          // 炎に重ねない。桶が置いてある側
+
+  g.strokeStyle = "rgba(232,220,208," + (0.13 + disturb * 0.05).toFixed(3) + ")";
+  g.lineWidth = 1; g.beginPath(); g.arc(cx, cy, rBase, 0, 6.284); g.stroke();  // 合わせる位置
+
+  const near = Math.min(phase, 1 - phase) < 0.10;
+  g.strokeStyle = near ? "rgba(255,214,150,0.92)" : "rgba(255,170,90,0.42)";
+  g.lineWidth = near ? 3 : 2;
+  g.beginPath(); g.arc(cx, cy, Math.max(4, r), 0, 6.284); g.stroke();
+
+  if (Me.bFlash > 0){                                          // 整った手応え
+    g.strokeStyle = "rgba(255,240,205," + (Me.bFlash * 0.85).toFixed(3) + ")";
+    g.lineWidth = 2 + Me.bFlash * 3;
+    g.beginPath(); g.arc(cx, cy, rBase + (1 - Me.bFlash) * 26, 0, 6.284); g.stroke();
+  }
+  if (Me.bMiss > 0){
+    g.strokeStyle = "rgba(255,110,70," + (Me.bMiss * 0.55).toFixed(3) + ")";
+    g.lineWidth = 2;
+    const j = (1 - Me.bMiss) * 8;
+    g.beginPath(); g.arc(cx + Math.sin(now / 30) * j, cy, rBase, 0, 6.284); g.stroke();
+  }
+  if (disturb > 0.35){                                        // 乱れているときだけ言葉にする
+    g.textAlign = "center"; g.font = "10px sans-serif";
+    g.globalAlpha = disturb * 0.6; g.fillStyle = COL.fire;
+    g.fillText("呼吸が乱れている", cx, cy - rBase - 12);
+    g.globalAlpha = 1;
+  } else if (hint){                                           // 最初の1回だけ。チュートリアルは作らない
+    g.textAlign = "center"; g.font = "10px sans-serif";
+    g.globalAlpha = 0.5; g.fillStyle = COL.text;
+    g.fillText("輪が重なった瞬間に、どこでも触れる", cx, cy - rBase - 12);
+    g.globalAlpha = 1;
+  }
+}
+
+function drawControls(now, canLoyly, canMove, moveDown, running){
   const pad = Math.max(10, W * 0.03);
   const bw = (W - pad * 4) / 3, bh = Math.max(64, H * 0.085);
   const by = H - bh - Math.max(20, H * 0.045);
@@ -608,6 +688,12 @@ function drawControls(now, canLoyly, canMove, moveDown, alive){
   g.textAlign = "left"; g.font = "9px sans-serif"; g.globalAlpha = 0.42; g.fillStyle = COL.text;
   g.fillText("体力", pad, stamY + 7); g.fillText("熱", pad, heatY + 7);
   g.globalAlpha = 1;
+
+  // 整いの度合いは体力バーの縁で見せる（バーを増やさない）
+  if (Me.calm > 0.55 && !Me.out){
+    g.strokeStyle = "rgba(255,240,205," + ((Me.calm - 0.55) * 1.1).toFixed(3) + ")";
+    g.lineWidth = 1.2; rr(gx - 1.5, stamY - 1.5, gw + 3, 10, 5); g.stroke();
+  }
 
   g.fillStyle = "rgba(255,255,255,0.07)"; rr(gx, stamY, gw, 7, 3.5); g.fill();
   const sg = g.createLinearGradient(gx, 0, gx + gw, 0);                 // 減ると赤に寄る
@@ -641,7 +727,9 @@ function drawControls(now, canLoyly, canMove, moveDown, alive){
     }
   };
 
-  face(Btn.loyly, canLoyly && !Me.out, "ロウリュ", canLoyly ? null : "ストーブが冷えていない");
+  // 理由は回が走っているときだけ出す（回の間は「満席」でも「冷えていない」でもない）
+  face(Btn.loyly, canLoyly && !Me.out, "ロウリュ",
+       (running && !canLoyly) ? "ストーブが冷えていない" : null);
   face(Btn.water, Me.water > 0 && !Me.out, "水", null);
   // 桶の残りは点で見せる
   for (let i = 0; i < WATER_MAX; i++){
@@ -650,7 +738,7 @@ function drawControls(now, canLoyly, canMove, moveDown, alive){
     g.fillStyle = i < Me.water ? "rgba(255,208,138,0.85)" : "rgba(232,220,208,0.16)"; g.fill();
   }
   face(Btn.move, canMove && !Me.out, moveDown ? "下がる" : "上がる",
-       moveDown ? (canMove ? null : "下段は満席") : null);
+       (running && moveDown && !canMove) ? "下段は満席" : null);
 }
 
 function drawTop(aliveCount, temp, rs, hell){
@@ -713,6 +801,7 @@ const App = {
       if (want < 0) return;
       Me.tier = want; Audio_.move(); Net.push(); return;
     }
+    this.breathe(now);                       // ボタン以外はどこでも呼吸
   },
 
   digest(people, now){
@@ -736,30 +825,66 @@ const App = {
         if (this.screen === "sauna" && now - e.t < LOYLY_TELL) Audio_.hiss();
       }
     }
-    // 予兆が切れた瞬間に降りてくる。ここで初めて熱が乗る
+    // 予兆が切れた瞬間に降りてくる。ここで熱が乗り、呼吸が飛ぶ
     for (const e of this.events.loyly){
       if (e.applied || now < e.t + LOYLY_TELL) continue;
       e.applied = true;
       this.roomLoyly = e.t + LOYLY_TELL;
       if (this.screen === "sauna"){
         Audio_.loyly();
-        if (!Me.out) Me.heat = clamp(Me.heat + LOYLY_HEAT, 0, HEAT_MAX);   // 押した人にも乗る
+        if (!Me.out){
+          const bite = loylyBite(Seats.tierOf(me), Seats.tiers);      // 上段ほど効く
+          Me.heat = clamp(Me.heat + LOYLY_HEAT * bite, 0, HEAT_MAX);
+          Me.bPhase = (Me.bPhase + 0.3 + 0.35 * unit("d" + e.t)) % 1; // 呼吸が飛ぶ＝合わせ直し
+          Me.bJudged = -1;
+        }
       }
     }
     this.events.loyly = this.events.loyly.filter(e => now - e.t < 30000);
     this.events.door = this.events.door.filter(e => now - e.t < 9000);
   },
 
-  // 熱と体力の進行。自分のぶんだけ計算し、心拍で他人に伝える
+  disturb(now){ return clamp(1 - (now - this.roomLoyly) / DISTURB_MS, 0, 1); },
+
+  // 呼吸・熱・体力の進行。自分のぶんだけ計算し、心拍で他人に伝える
   tick(now, dt, rs){
     if (!rs.running || Me.out) return;
-    const eq = heatEquilibrium(Seats.tierOf(me), Seats.tiers, now - this.roomLoyly < 8000);
+    const tier = Seats.tierOf(me), tiers = Seats.tiers;
+
+    // 呼吸を進める。1周期を放置したら整いが落ちる＝手を止めていられない
+    const per = breathPeriod(tier, tiers, this.disturb(now));
+    Me.bPhase += dt / per;
+    while (Me.bPhase >= 1){
+      Me.bPhase -= 1; Me.bCycle++;
+      if (Me.bJudged < Me.bCycle - 1) Me.calm = clamp(Me.calm - CALM_LAPSE, 0, 1);
+    }
+    Me.bFlash = Math.max(0, Me.bFlash - dt * 3.2);
+    Me.bMiss  = Math.max(0, Me.bMiss  - dt * 3.2);
+
+    const eq = heatEquilibrium(tier, tiers, now - this.roomLoyly < 8000);
     Me.heat = clamp(Me.heat + (eq - Me.heat) * HEAT_K * dt, 0, HEAT_MAX);
-    Me.stam = Math.max(0, Me.stam - drainRate(Me.heat) * dt);
+    Me.stam = Math.max(0, Me.stam - drainRate(Me.heat, Me.calm) * dt);
     if (Me.stam <= 0){
       Me.out = true; Audio_.out();
       this.banner = {text: "のぼせた", until: now + 2200};
       Net.push();
+    }
+  },
+
+  // 呼吸のタップ。ふくらみ切った瞬間（位相0付近）で整う
+  breathe(now){
+    const d = Math.min(Me.bPhase, 1 - Me.bPhase);            // 位相0からの距離
+    const per = breathPeriod(Seats.tierOf(me), Seats.tiers, this.disturb(now));
+    const offMs = d * per * 1000;
+    const cycle = Me.bPhase > 0.5 ? Me.bCycle + 1 : Me.bCycle;
+    if (Me.bJudged === cycle) return;                        // 1周期に1回だけ
+    Me.bJudged = cycle;
+    if (offMs <= BREATH_HIT){
+      Me.calm = clamp(Me.calm + CALM_GAIN, 0, 1);
+      Me.bFlash = 1; Audio_.breathIn();
+    } else {
+      Me.calm = clamp(Me.calm - CALM_MISS, 0, 1);
+      Me.bMiss = 1; Audio_.breathOff();
     }
   },
 
@@ -788,6 +913,7 @@ const App = {
     const here = all.filter(p => p.s === "i");
     if (rs.idx !== Me.round){                                 // 回が変わったら全員やり直し
       const wasOut = Me.out;
+      if (Me.round >= 0){ Me.played++; if (!wasOut) Me.survived++; }
       Me.reset(rs.idx); Net.push();
       if (wasOut) this.banner = {text: "つぎの回", until: now + 1500};
     }
@@ -823,12 +949,15 @@ const App = {
       const s = Seats.list[gh.seat]; if (!s) continue;
       drawPerson(s.x, s.y, s.s, gh.id, (1 - (performance.now() - gh.t) / SEAT_FADE) * 0.5, false, 0, false);
     }
+    // ロウリュが降りた直後のすくみ。段ごとに大きさが違う＝誰に当たったかが見える
+    const recoil = clamp(1 - (now - this.roomLoyly) / 480, 0, 1);
     const order = alive.slice().sort((a, b) => (Seats.map[a.id] ?? 0) - (Seats.map[b.id] ?? 0));
     for (const p of order){
       const s = Seats.list[Seats.map[p.id]]; if (!s) continue;
       drawPerson(s.x, s.y, s.s, p.id, 1, p.id === me,
                  p.id === me ? Me.heat : p.heat, false,
-                 p.id === me ? Me.stam : p.stam);
+                 p.id === me ? Me.stam : p.stam,
+                 recoil * (loylyBite(s.tier, Seats.tiers) / 1.8));
     }
     // 出された人は床に座り込んで見ている（部屋から消えない＝人が減らない）
     const outs = inRound.filter(p => p.out);
@@ -850,8 +979,11 @@ const App = {
     const cur = Seats.tierOf(me), last = Seats.tiers - 1;
     const moveDown = cur < last;
     const canMove = rs.running && (moveDown ? Seats.freeIn(cur + 1, inRound) : true);
+    if (rs.running && !Me.out)
+      drawBreath(now, H * 0.705, this.disturb(now),
+                 Me.played === 0 && rs.left > ROUND_MS - 12000);
     drawTop(alive.length, temp, rs, hell);
-    drawControls(now, canLoyly, canMove, moveDown, alive.length);
+    drawControls(now, canLoyly, canMove, moveDown, rs.running);
 
     if (!rs.running){                                          // 回の間
       g.fillStyle = "rgba(8,6,5,0.55)"; g.fillRect(0, 0, W, H);
@@ -860,6 +992,10 @@ const App = {
       g.fillText("つぎの回は " + Math.ceil(rs.toNext / 1000) + "秒後", W / 2, H * 0.44);
       g.globalAlpha = 0.45; g.font = "12px sans-serif";
       g.fillText("いま " + here.length + "人", W / 2, H * 0.44 + 26);
+      if (Me.played > 0){                                      // 今夜の記録だけ。保存も順位も作らない
+        g.globalAlpha = 0.62; g.font = "13px sans-serif"; g.fillStyle = COL.core;
+        g.fillText("今夜 " + Me.played + "回中 " + Me.survived + "回のこった", W / 2, H * 0.44 + 54);
+      }
       g.globalAlpha = 1;
     }
     if (this.banner && now < this.banner.until){
