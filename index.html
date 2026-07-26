@@ -1,7 +1,24 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
 <meta name="theme-color" content="#0d0906">
-<title>とおいサウナ</title>
+<title>とおいサウナ｜喋らずに熱さを競うオンラインサウナ</title>
+<meta name="description" content="全員が本当に同じ炎を見ている。ロウリュで他人を熱くできる。喋らない。毎時00分と30分に、15分だけ開く。">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="とおいサウナ">
+<meta property="og:title" content="とおいサウナ｜喋らずに熱さを競うオンラインサウナ">
+<meta property="og:description" content="全員が本当に同じ炎を見ている。ロウリュで他人を熱くできる。喋らない。毎時00分と30分に、15分だけ開く。">
+<meta property="og:url" content="https://tmk4men.github.io/tooi-sauna/">
+<meta property="og:image" content="https://tmk4men.github.io/tooi-sauna/ogp.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="薄暗いサウナ室。段に腰かけた人たちと、中央のストーブで上がる炎">
+<meta property="og:locale" content="ja_JP">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="とおいサウナ｜喋らずに熱さを競うオンラインサウナ">
+<meta name="twitter:description" content="全員が本当に同じ炎を見ている。ロウリュで他人を熱くできる。喋らない。毎時00分と30分に、15分だけ開く。">
+<meta name="twitter:image" content="https://tmk4men.github.io/tooi-sauna/ogp.png">
+<meta name="twitter:image:alt" content="薄暗いサウナ室。段に腰かけた人たちと、中央のストーブで上がる炎">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230d0906'/%3E%3Cpath d='M16 4c3 5 7 7.5 7 12.5a7 7 0 0 1-14 0c0-3 2-5.2 4.2-7.2 0 2.1 1 3.2 1.9 3.2 1 0 1.1-4.2 0.9-8.5z' fill='%23ff7a1a'/%3E%3Cpath d='M16 14c1.6 2.5 3 3.7 3 6.2a3 3 0 0 1-6 0c0-1.9 1.4-3.4 3-6.2z' fill='%23ffd08a'/%3E%3Crect x='9' y='25' width='14' height='3' rx='1.5' fill='%23241812'/%3E%3C/svg%3E">
 <style>
   *{margin:0;padding:0;box-sizing:border-box}
@@ -43,7 +60,11 @@ const SEAT_FADE   = 2000;
 //   体力 … 熱が高いほど速く減る。戻らない。0で出される
 //   ＝水は「延命」であって「解除」ではない。回に必ず終わりと山ができる
 const HEAT_MAX    = 100;
-const HEAT_K      = FAST ? 0.16 : 0.045;          // 落ち着き先へ近づく速さ（毎秒）
+const HEAT_K      = FAST ? 0.10 : 0.024;          // 落ち着き先へ近づく速さ。小さいほどじんわり
+const SURGE_TAU   = 0.45;                         // ロウリュの熱が乗り切るまでの緩み（秒）
+const BAR_TAU_H   = 0.34;                         // 表示上の熱の追従（見た目が跳ねないように）
+const BAR_TAU_S   = 0.16;                         // 表示上の体力の追従
+const LOOK_TAU    = 0.50;                         // 他人の姿勢の追従（心拍は2秒おきなので滑らかにする）
 const HEAT_DROP   = 58;                           // 上段と下段の落ち着き先の差
 const STAM_MAX    = 100;
 const STAM_BASE   = STAM_MAX / (FAST ? 22 : 120); // 体力の減り。熱で倍率がかかる
@@ -300,6 +321,8 @@ addEventListener("beforeunload", () => Net.leave());
 const Me = {
   tier: 1, heat: 0, stam: STAM_MAX, water: WATER_MAX, out: false, round: -1, lastLoyly: 0,
   calm: 0.5,              // 呼吸が整っている度合い
+  surge: 0,               // ロウリュで乗る途中の熱（一気に乗せず、じんわり流し込む）
+  dHeat: 0, dStam: STAM_MAX,  // 表示用。実値へ遅れて追いつく
   bPhase: 0,              // 呼吸の位相（0でふくらみ切る）
   bCycle: 0,              // 何周期目か。1周期に判定は1回だけ
   bJudged: -1,            // 判定済みの周期
@@ -308,6 +331,7 @@ const Me = {
   survived: 0, played: 0, // 今夜の記録（この場だけ。保存しない）
   reset(r){
     this.round = r; this.heat = 0; this.stam = STAM_MAX;
+    this.surge = 0; this.dHeat = 0; this.dStam = STAM_MAX;
     this.water = WATER_MAX; this.out = false;
     this.tier = Math.min(1, Math.max(0, Seats.tiers - 1));
     this.lastLoyly = 0; this.calm = 0.5;
@@ -775,6 +799,19 @@ function drawSteam(now, events){
 
 const Btn = {loyly: null, water: null, move: null};
 
+// 表示だけを遅らせて追いつかせる。数値が跳ねても画は跳ねない
+const approach = (cur, target, tau, dt) => cur + (target - cur) * (1 - Math.exp(-dt / tau));
+
+// 他人の見た目。心拍は2秒おきなので、そのまま描くと姿勢が段階的に飛ぶ
+const Look = new Map();
+function lookOf(id, heat, stam, dt){
+  let o = Look.get(id);
+  if (!o){ o = {heat, stam}; Look.set(id, o); }
+  o.heat = approach(o.heat, heat, LOOK_TAU, dt);
+  o.stam = approach(o.stam, stam, LOOK_TAU, dt);
+  return o;
+}
+
 // 呼吸の輪。ふくらみ切った瞬間にタップする。乱れているとふらつく
 function drawBreath(now, cy, disturb, hint){
   const phase = Me.bPhase;
@@ -836,8 +873,8 @@ function drawControls(now, canLoyly, canMove, moveDown, running){
   const gw = W - pad * 2 - 26;
   const gx = pad + 26;
   const stamY = by - 26, heatY = by - 13;
-  const st = clamp(Me.stam / STAM_MAX, 0, 1);
-  const hot = clamp(Me.heat / HEAT_MAX, 0, 1);
+  const st = clamp(Me.dStam / STAM_MAX, 0, 1);       // 表示値。跳ねずに追いつく
+  const hot = clamp(Me.dHeat / HEAT_MAX, 0, 1);
 
   g.textAlign = "left"; g.font = "9px sans-serif"; g.globalAlpha = 0.42; g.fillStyle = COL.text;
   g.fillText("体力", pad, stamY + 7); g.fillText("熱", pad, heatY + 7);
@@ -1030,7 +1067,7 @@ const App = {
         Audio_.loyly();
         if (!Me.out){
           const bite = loylyBite(Seats.tierOf(me), Seats.tiers);      // 上段ほど効く
-          Me.heat = clamp(Me.heat + LOYLY_HEAT * bite, 0, HEAT_MAX);
+          Me.surge += LOYLY_HEAT * bite;                              // 一気に乗せず、じんわり流し込む
           Me.bPhase = (Me.bPhase + 0.3 + 0.35 * unit("d" + e.t)) % 1; // 呼吸が飛ぶ＝合わせ直し
           Me.bJudged = -1;
         }
@@ -1059,6 +1096,11 @@ const App = {
 
     const eq = heatEquilibrium(tier, tiers, now - this.roomLoyly < 8000);
     Me.heat = clamp(Me.heat + (eq - Me.heat) * HEAT_K * dt, 0, HEAT_MAX);
+    if (Me.surge > 0.01){                                // ロウリュぶんを少しずつ流し込む
+      const add = Me.surge * (1 - Math.exp(-dt / SURGE_TAU));
+      Me.surge -= add;
+      Me.heat = clamp(Me.heat + add, 0, HEAT_MAX);
+    } else Me.surge = 0;
     Me.stam = Math.max(0, Me.stam - drainRate(Me.heat, Me.calm) * dt);
     if (Me.stam <= 0){
       Me.out = true; Audio_.out();
@@ -1120,6 +1162,9 @@ const App = {
     this.digest(here, now);
     this.fidget(here, now);
     this.tick(now, dt, rs);
+    Me.dHeat = approach(Me.dHeat, Me.heat, BAR_TAU_H, dt);   // 見た目を実値へじんわり寄せる
+    Me.dStam = approach(Me.dStam, Me.stam, BAR_TAU_S, dt);
+    if (Look.size > 200) Look.clear();
 
     if (rs.running && alive.length === 1 && here.length > 1 && this.wasAlive){
       if (alive[0].id === me){ Audio_.win(); this.banner = {text: "ととのった", until: now + 3000}; }
@@ -1150,9 +1195,9 @@ const App = {
     const order = alive.slice().sort((a, b) => (Seats.map[a.id] ?? 0) - (Seats.map[b.id] ?? 0));
     for (const p of order){
       const s = Seats.list[Seats.map[p.id]]; if (!s) continue;
-      drawPerson(s.x, s.y, s.s, p.id, 1, p.id === me,
-                 p.id === me ? Me.heat : p.heat, false,
-                 p.id === me ? Me.stam : p.stam,
+      const mine = p.id === me;
+      const lk = mine ? {heat: Me.dHeat, stam: Me.dStam} : lookOf(p.id, p.heat, p.stam, dt);
+      drawPerson(s.x, s.y, s.s, p.id, 1, mine, lk.heat, false, lk.stam,
                  recoil * (loylyBite(s.tier, Seats.tiers) / 1.8));
     }
     // 出された人は床に座り込んで見ている（部屋から消えない＝人が減らない）
