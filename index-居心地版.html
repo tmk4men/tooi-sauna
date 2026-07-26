@@ -1,0 +1,665 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#0d0906">
+<title>とおいサウナ</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;overflow:hidden;background:#0d0906;
+    -webkit-tap-highlight-color:transparent;-webkit-user-select:none;user-select:none;
+    font-family:"Hiragino Sans","Yu Gothic UI","Noto Sans JP",system-ui,sans-serif}
+  canvas{display:block;width:100%;height:100%;touch-action:none}
+</style>
+<canvas id="c"></canvas>
+<script>
+/* =========================================================================
+   とおいサウナ — ロウリュの1点を確かめる版（設計メモ §8）
+   確かめるのは2つだけ。①10人集まるか ②ロウリュの瞬間に他人がいると感じるか
+   ========================================================================= */
+
+/* ---- 設定 ------------------------------------------------------------- */
+
+// Firebase Realtime Database の URL。空のままだと「ひとり」で動く（体感の確認用）
+// 例: "https://xxxx-default-rtdb.asia-southeast1.firebasedatabase.app"
+const DB = "";
+
+// 2026-07-26 に決めた2点。両方 false にすると「居心地だけ」版に戻る（勝ち筋.md 13）
+const LOYLY_AS_HARDSHIP = true;   // ロウリュを快ではなく「他人に熱くされる軽い災難」にする
+const SHOW_ELAPSED      = true;   // 誰が何分入っているかを見せる（勝者宣言・記録・順位は作らない）
+
+const Q = new URLSearchParams(location.search);
+const ROOM        = (Q.get("room") || "main").replace(/[^a-zA-Z0-9_-]/g, "");
+const ALWAYS_OPEN = Q.get("open") === "1";        // 開場時刻を待たずに入る（動作確認用）
+const OPEN_FROM   = [0, 30];                      // 毎時00分と30分から
+const OPEN_LEN    = 15;                           // 15分だけ開く
+const LOYLY_COOL  = 5 * 60 * 1000;                // ロウリュは1人5分に1回
+const HB_MS       = 2000;                         // presence の心拍
+const STALE_MS    = 7000;                         // これを過ぎたら退室とみなす
+const SEAT_FADE   = 2000;                         // 席の余韻（設計メモ §4）
+
+/* ---- 決定的な乱数とノイズ（全端末で同じ絵・同じ音にするための土台）---- */
+
+function hash32(s){
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < s.length; i++){ h ^= s.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
+  h ^= h >>> 13; h = Math.imul(h, 2246822507) >>> 0; h ^= h >>> 16;
+  return h >>> 0;
+}
+const unit = s => hash32(s) / 4294967296;                  // 文字列 → 0..1
+function ihash(i){ let h = Math.imul(i ^ 0x9e3779b9, 2654435761) >>> 0; h ^= h >>> 15; return (h >>> 0) / 4294967296; }
+const smooth = t => t * t * (3 - 2 * t);
+function noise(x){                                          // 1次元の値ノイズ 0..1
+  const i = Math.floor(x), f = x - i;
+  return ihash(i) + (ihash(i + 1) - ihash(i)) * smooth(f);
+}
+
+/* ---- 時刻（サーバー基準。全員が同じフレームの炎を見るため）------------ */
+
+let clockOffset = 0;                                        // serverNow = Date.now() + offset
+const serverNow = () => Date.now() + clockOffset;
+const frameOf   = t => Math.floor(t / 33);                  // 33ms = 1フレーム（設計メモ §2）
+
+// 日本時間の「分」。端末のタイムゾーンに依存させない
+function jstMinuteOfHour(t){ return Math.floor((t + 9 * 3600e3) / 60000) % 60; }
+function isOpen(t){
+  if (ALWAYS_OPEN) return true;
+  const m = jstMinuteOfHour(t);
+  return OPEN_FROM.some(s => m >= s && m < s + OPEN_LEN);
+}
+function nextOpenAt(t){
+  const m = jstMinuteOfHour(t);
+  const hourStart = t - (m * 60000) - (((t + 9 * 3600e3) % 60000));
+  for (const s of OPEN_FROM) if (m < s) return hourStart + s * 60000;
+  return hourStart + 60 * 60000 + OPEN_FROM[0] * 60000;
+}
+function clockLabel(t){
+  const j = new Date(t + 9 * 3600e3);
+  return String(j.getUTCHours()).padStart(2, "0") + ":" + String(j.getUTCMinutes()).padStart(2, "0");
+}
+
+/* ---- 音（すべて生成。presence の主役は音）----------------------------- */
+
+const Audio_ = {
+  ctx: null, master: null, noiseBuf: null, stoveGain: null, lastCloth: 0,
+  start(){
+    if (this.ctx) return;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    this.ctx = new AC();
+    this.master = this.ctx.createGain();
+    this.master.gain.value = 0.9;
+    this.master.connect(this.ctx.destination);
+
+    const n = this.ctx.sampleRate * 2;
+    this.noiseBuf = this.ctx.createBuffer(1, n, this.ctx.sampleRate);
+    const d = this.noiseBuf.getChannelData(0);
+    let last = 0;
+    for (let i = 0; i < n; i++){ const w = Math.random() * 2 - 1; last = (last + 0.02 * w) / 1.02; d[i] = last * 3.5; }
+
+    // ストーブの低い唸り（常時）
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.noiseBuf; src.loop = true;
+    const lp = this.ctx.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = 240;
+    this.stoveGain = this.ctx.createGain(); this.stoveGain.gain.value = 0.10;
+    src.connect(lp).connect(this.stoveGain).connect(this.master);
+    src.start();
+
+    // 火のゆらぎ（ゆっくり息をする）
+    const lfo = this.ctx.createOscillator(); lfo.frequency.value = 0.13;
+    const lfoG = this.ctx.createGain(); lfoG.gain.value = 0.035;
+    lfo.connect(lfoG).connect(this.stoveGain.gain); lfo.start();
+  },
+  burst({dur = 0.3, type = "bandpass", f0 = 1200, f1 = 1200, q = 1, vol = 0.2, delay = 0}){
+    if (!this.ctx) return;
+    const t = this.ctx.currentTime + delay;
+    const s = this.ctx.createBufferSource(); s.buffer = this.noiseBuf;
+    s.playbackRate.value = 0.8 + Math.random() * 0.4;
+    const f = this.ctx.createBiquadFilter(); f.type = type; f.Q.value = q;
+    f.frequency.setValueAtTime(f0, t);
+    f.frequency.exponentialRampToValueAtTime(Math.max(60, f1), t + dur);
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(vol, t + Math.min(0.05, dur * 0.2));
+    g.gain.exponentialRampToValueAtTime(0.0008, t + dur);
+    s.connect(f).connect(g).connect(this.master);
+    s.start(t); s.stop(t + dur + 0.05);
+  },
+  thud(vol = 0.35){
+    if (!this.ctx) return;
+    const t = this.ctx.currentTime;
+    const o = this.ctx.createOscillator(); o.type = "sine";
+    o.frequency.setValueAtTime(96, t); o.frequency.exponentialRampToValueAtTime(42, t + 0.22);
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
+    o.connect(g).connect(this.master); o.start(t); o.stop(t + 0.32);
+  },
+  door(){ this.thud(0.3); this.burst({dur:.5, f0:1500, f1:300, q:.7, vol:.16}); },       // 開いて、冷気が入る
+  loyly(){                                                                               // ジュッ
+    this.burst({dur:1.9, f0:7000, f1:900, q:.6, vol:.34});
+    this.burst({dur:2.4, f0:400,  f1:140, q:.8, vol:.14, delay:.05});
+    this.thud(0.14);
+  },
+  cloth(t){                                                                              // 衣擦れ・座り直し
+    if (t - this.lastCloth < 1100) return;
+    this.lastCloth = t;
+    this.burst({dur:.18, f0:2600, f1:1400, q:1.4, vol:.055});
+  }
+};
+
+/* ---- 通信（presence / ロウリュ / サーバー時刻 の3種類だけ）------------ */
+
+const me = (() => {
+  let v = sessionStorage.getItem("tsid");
+  if (!v){ v = Math.random().toString(36).slice(2, 10); sessionStorage.setItem("tsid", v); }
+  return v;
+})();
+
+const Net = {
+  live: !!DB, joined: false, myJoin: 0,
+  members: {},                    // id -> {t, j, s}   s: "i"=中 / "w"=脱衣所
+  loyly: {},                      // key -> {t}
+  seen: false,                    // 最初のスナップショットを受けたか（受ける前は演出しない）
+  url(p){ return DB.replace(/\/+$/, "") + "/rooms/" + ROOM + p; },
+
+  async join(state){
+    if (!this.live){                                        // ひとりモード
+      this.members[me] = {t: serverNow(), j: serverNow(), s: state};
+      this.myJoin = this.members[me].j; this.joined = true; this.seen = true;
+      return;
+    }
+    const t0 = Date.now();
+    try {
+      const r = await fetch(this.url("/m/" + me + ".json"), {
+        method: "PUT",
+        body: JSON.stringify({t: {".sv": "timestamp"}, j: {".sv": "timestamp"}, s: state})
+      });
+      const got = await r.json();                           // サーバーが解決した時刻が返る
+      if (got && typeof got.j === "number"){
+        clockOffset = got.j - (t0 + (Date.now() - t0) / 2);  // ここでサーバー時刻に合わせる
+        this.myJoin = got.j;
+      }
+      this.joined = true;
+      this.stream();
+      this.beat();
+    } catch(e){ this.live = false; this.join(state); }       // 繋がらなければひとりで続ける
+  },
+
+  stream(){
+    const es = new EventSource(this.url(".json"));
+    const apply = (path, data) => {
+      const seg = path.split("/").filter(Boolean);
+      if (!seg.length){                                     // 全体の置き換え
+        this.members = (data && data.m) || {};
+        this.loyly   = (data && data.l) || {};
+      } else if (seg[0] === "m"){
+        if (seg.length === 1) this.members = data || {};
+        else if (data === null) delete this.members[seg[1]];
+        else this.members[seg[1]] = Object.assign(this.members[seg[1]] || {}, data);
+      } else if (seg[0] === "l"){
+        if (seg.length === 1) this.loyly = data || {};
+        else if (data === null) delete this.loyly[seg[1]];
+        else this.loyly[seg[1]] = data;
+      }
+      this.seen = true;
+    };
+    es.addEventListener("put",   e => { const d = JSON.parse(e.data); apply(d.path, d.data); });
+    es.addEventListener("patch", e => {
+      const d = JSON.parse(e.data);
+      for (const k in d.data) apply((d.path === "/" ? "" : d.path) + "/" + k, d.data[k]);
+    });
+    es.onerror = () => {};                                  // EventSource は自分で再接続する
+  },
+
+  beat(){
+    setInterval(() => {
+      if (!this.live) return;
+      fetch(this.url("/m/" + me + ".json"), {
+        method: "PATCH",
+        body: JSON.stringify({t: {".sv": "timestamp"}, s: App.screen === "sauna" ? "i" : "w"})
+      }).catch(() => {});
+      this.sweep();
+    }, HB_MS);
+  },
+
+  sweep(){                                                  // 古いロウリュの記録を掃く（誰かが気づいたら消す）
+    const now = serverNow();
+    for (const k in this.loyly){
+      if (now - (this.loyly[k].t || 0) > 120000)
+        fetch(this.url("/l/" + k + ".json"), {method: "DELETE"}).catch(() => {});
+    }
+  },
+
+  sendLoyly(){
+    if (!this.live){ const k = "x" + Math.random().toString(36).slice(2); this.loyly[k] = {t: serverNow()}; return; }
+    fetch(this.url("/l.json"), {method: "POST", body: JSON.stringify({t: {".sv": "timestamp"}})}).catch(() => {});
+  },
+
+  leave(){
+    if (!this.live || !this.joined) return;
+    try { fetch(this.url("/m/" + me + ".json"), {method: "DELETE", keepalive: true}); } catch(e){}
+  },
+
+  present(){                                                // 生きている人だけ（心拍が新しい人）
+    const now = serverNow(), out = [];
+    for (const id in this.members){
+      const m = this.members[id];
+      if (!m || typeof m.t !== "number") continue;
+      if (now - m.t <= STALE_MS) out.push({id, j: m.j || m.t, s: m.s || "i"});
+    }
+    return out.sort((a, b) => a.id < b.id ? -1 : 1);         // 並びを全端末で揃える
+  }
+};
+addEventListener("pagehide", () => Net.leave());
+addEventListener("beforeunload", () => Net.leave());
+
+/* ---- 席（他人が抜けても自分の席が動かないように、id から決める）-------- */
+
+const Seats = {
+  list: [], map: {}, ghosts: [], tierY: [], benchH: 0, cap: 0,
+  // 席は必ず人数より多く作る。足りないと描かれない人が出て「嘘をつかない」が崩れる
+  build(W, H, need){
+    need = Math.max(20, need | 0);
+    let tiers = 3, p = 0;
+    for (;;){
+      p = Math.ceil((need + tiers * (tiers - 1) / 2) / tiers);
+      if (p <= 10 || tiers >= 5) break;
+      tiers++;
+    }
+    p = Math.max(4, p);
+    this.list = []; this.tierY = []; this.benchH = H * 0.024;
+    const TOP = 0.30, BOT = 0.60;
+    for (let r = 0; r < tiers; r++){
+      const y = H * (tiers === 1 ? (TOP + BOT) / 2 : TOP + (BOT - TOP) * (r / (tiers - 1)));
+      this.tierY.push(y);
+      const n = Math.max(1, p - r);
+      const inset = W * (0.085 + (tiers - 1 - r) * 0.028);   // 奥の段ほど狭い
+      const span = Math.max(40, W - inset * 2);
+      const spacing = n > 1 ? span / (n - 1) : span;
+      const dens = Math.min(1, spacing / 38);                // 詰まってきたら小さく座らせる
+      const depth = tiers === 1 ? 1 : r / (tiers - 1);
+      const s = (0.74 + depth * 0.26) * Math.max(0.62, dens); // 手前の段が大きい＝奥が小さい
+      for (let i = 0; i < n; i++){
+        const x = n === 1 ? W / 2 : inset + span * (i / (n - 1));
+        this.list.push({x, y, s, tier: r});
+      }
+    }
+    this.cap = this.list.length;
+  },
+  ensure(n){ if (n > this.cap) this.build(W, H, n + 6); },
+  assign(people){                                           // hash で席を決め、衝突したら次を探す
+    const S = this.list.length, used = new Array(S).fill(null), next = {};
+    for (const p of people){
+      let k = hash32(p.id) % S;
+      for (let i = 0; i < S; i++){ const c = (k + i) % S; if (!used[c]){ used[c] = p.id; next[p.id] = c; break; } }
+    }
+    for (const id in this.map)                              // 抜けた人の席に余韻を2秒残す
+      if (!(id in next) && this.list[this.map[id]])
+        this.ghosts.push({seat: this.map[id], id, t: performance.now()});
+    this.map = next;
+    this.ghosts = this.ghosts.filter(g => performance.now() - g.t < SEAT_FADE && !(g.id in next));
+  }
+};
+
+/* ---- 温度（人数と出入りとロウリュで動く。全端末で同じ計算）------------ */
+
+function temperature(people, now, events){
+  let t = 78 + 0.35 * people.length;
+  for (const e of events.loyly){ const a = now - e.t; if (a >= 0 && a < 30000) t += 3.0 * Math.exp(-a / 13000); }
+  for (const e of events.door){  const a = now - e.t; if (a >= 0 && a < 9000)  t -= 0.5 * (1 - a / 9000); }
+  return Math.max(68, Math.min(108, t));
+}
+
+/* ---- 画（Canvas。絵文字は使わない。すべてベクター描画）---------------- */
+
+const cv = document.getElementById("c"), g = cv.getContext("2d");
+let W = 0, H = 0, DPR = 1;
+function resize(){
+  DPR = Math.min(2, devicePixelRatio || 1);
+  W = innerWidth; H = innerHeight;
+  cv.width = Math.floor(W * DPR); cv.height = Math.floor(H * DPR);
+  g.setTransform(DPR, 0, 0, DPR, 0, 0);
+  Seats.build(W, H, Seats.cap || 20);
+}
+addEventListener("resize", resize);
+
+const COL = { bg:"#0d0906", wood:"#241812", wood2:"#2c1d15", body:"#120e0b", text:"#e8dcd0", fire:"#ff7a1a", core:"#ffd08a" };
+
+function rr(x, y, w, h, r){
+  g.beginPath();
+  r = Math.min(r, w / 2, h / 2);
+  g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath();
+}
+
+// 部屋（天井 → 壁 → ドア → 段）。ドアは段より奥に描くので人と重ならない
+function drawRoom(doorGlow){
+  const grd = g.createLinearGradient(0, 0, 0, H);
+  grd.addColorStop(0, "#080605"); grd.addColorStop(0.42, "#150e0a"); grd.addColorStop(1, "#241710");
+  g.fillStyle = grd; g.fillRect(0, 0, W, H);
+
+  const ceil = H * 0.075;                                           // 天井際は暗く落とす
+  g.fillStyle = "rgba(0,0,0,0.35)"; g.fillRect(0, 0, W, ceil);
+  g.strokeStyle = "rgba(255,180,120,0.05)";                         // 壁の板
+  g.lineWidth = 1;
+  for (let x = 0; x < W; x += 34){ g.beginPath(); g.moveTo(x + 0.5, ceil); g.lineTo(x + 0.5, H * 0.70); g.stroke(); }
+
+  // ドア（上手の壁。段より上に置いて座席と衝突させない）
+  const dw = Math.min(60, W * 0.145), dh = H * 0.165;
+  const dx = W * 0.05, dy = H * 0.10;
+  g.fillStyle = "#150e0a"; rr(dx, dy, dw, dh, 3); g.fill();
+  g.strokeStyle = "rgba(255,190,130,0.10)"; g.lineWidth = 1; rr(dx + 4, dy + 4, dw - 8, dh - 8, 2); g.stroke();
+  const seam = 0.07 + doorGlow * 0.62;                              // 開いた瞬間だけ光と冷気が差す
+  g.fillStyle = "rgba(200,225,255," + seam.toFixed(3) + ")";
+  g.fillRect(dx + dw - 2, dy + 3, 2.5, dh - 6);
+  if (doorGlow > 0.02){
+    const sp = g.createLinearGradient(dx, 0, dx + dw * 2.4, 0);
+    sp.addColorStop(0, "rgba(190,220,255," + (doorGlow * 0.16).toFixed(3) + ")");
+    sp.addColorStop(1, "rgba(190,220,255,0)");
+    g.fillStyle = sp; g.fillRect(dx, dy, dw * 2.4, dh + H * 0.06);
+  }
+
+  for (let i = 0; i < Seats.tierY.length; i++){                     // 段
+    const y = Seats.tierY[i] + 2;
+    g.fillStyle = i % 2 ? COL.wood2 : COL.wood;
+    rr(-10, y, W + 20, Seats.benchH, 3); g.fill();
+    g.fillStyle = "rgba(255,195,135,0.06)"; g.fillRect(-10, y, W + 20, 1.5);
+    g.fillStyle = "rgba(0,0,0,0.22)"; g.fillRect(-10, y + Seats.benchH, W + 20, 3);
+  }
+}
+
+function drawStove(t, hell){
+  const cx = W / 2, base = H * 0.82, w = Math.min(118, W * 0.30), h = H * 0.085;
+  const F = frameOf(t);
+
+  const glow = g.createRadialGradient(cx, base - h * 0.7, 4, cx, base - h * 0.7, w * 1.9);
+  glow.addColorStop(0, "rgba(255,140,50," + (0.30 + hell * 0.22).toFixed(3) + ")");
+  glow.addColorStop(1, "rgba(255,100,20,0)");
+  g.fillStyle = glow; g.fillRect(cx - w * 2, base - h * 3.4, w * 4, h * 4.6);
+
+  g.fillStyle = "#150e0a"; rr(cx - w / 2, base - h, w, h, 5); g.fill();            // 炉
+  g.fillStyle = "rgba(255,190,130,0.07)"; g.fillRect(cx - w / 2 + 4, base - h, w - 8, 1.5);
+  for (let i = 0; i < 11; i++){                                                     // サウナストーン
+    const a = unit("st" + i);
+    const sx = cx - w / 2 + 8 + (w - 16) * a, sy = base - h + 5 + unit("sy" + i) * (h * 0.42);
+    g.fillStyle = i % 3 ? "#2b241f" : "#332b25";
+    g.beginPath(); g.ellipse(sx, sy, 5 + a * 4, 4 + a * 2.5, a * 3, 0, 6.284); g.fill();
+  }
+
+  const y0 = base - h * 0.52, fh = h * (2.1 + hell * 0.8);
+  // 外炎→中炎→芯の3層。横に広げず縦に伸ばす（幅より高さが勝つと火に見える）
+  const layers = [
+    {n: 4, w: 1.15, h: 1.00, a: "rgba(255,105,25,0.20)", b: "rgba(175,32,4,0)"},
+    {n: 5, w: 0.80, h: 0.74, a: "rgba(255,158,52,0.38)", b: "rgba(212,62,9,0)"},
+    {n: 4, w: 0.48, h: 0.44, a: "rgba(255,230,182,0.72)", b: "rgba(255,182,88,0)"}
+  ];
+  for (let L = 0; L < layers.length; L++){
+    const ly = layers[L];
+    for (let i = 0; i < ly.n; i++){
+      const n1 = noise(F / 10 + i * 37.7 + L * 13.3);
+      const n2 = noise(F / 15 + i * 91.3 + L * 71.1);
+      const n3 = noise(F / 8  + i * 53.1 + L * 29.7);
+      const px  = cx + (ly.n === 1 ? 0 : (i / (ly.n - 1) - 0.5)) * w * 0.34;
+      const hgt = fh * ly.h * (0.62 + 0.48 * n1);
+      const lean = (n2 - 0.5) * w * 0.09;
+      const wid = (w / (ly.n + 2)) * ly.w * (0.8 + 0.4 * n3);
+      const grd = g.createLinearGradient(px, y0, px, y0 - hgt);
+      grd.addColorStop(0, ly.a); grd.addColorStop(0.55, ly.a); grd.addColorStop(1, ly.b);
+      g.fillStyle = grd;
+      g.beginPath();
+      g.moveTo(px - wid, y0);
+      g.bezierCurveTo(px - wid * 0.98, y0 - hgt * 0.34, px - wid * 0.52 + lean, y0 - hgt * 0.76, px + lean, y0 - hgt);
+      g.bezierCurveTo(px + wid * 0.52 + lean, y0 - hgt * 0.76, px + wid * 0.98, y0 - hgt * 0.34, px + wid, y0);
+      g.closePath(); g.fill();
+    }
+  }
+  const bg2 = g.createRadialGradient(cx, y0, 1, cx, y0, w * 0.3);    // 火床の光で底の線を消す
+  bg2.addColorStop(0, "rgba(255,205,140,0.40)"); bg2.addColorStop(1, "rgba(255,150,60,0)");
+  g.fillStyle = bg2; g.beginPath(); g.ellipse(cx, y0, w * 0.3, h * 0.17, 0, 0, 6.284); g.fill();
+
+  for (let i = 0; i < 11; i++){                                                     // 火の粉
+    const life = ((F * 1.5 + i * 143) % 240) / 240;
+    const ex = cx + (noise(F / 26 + i * 11.1) - 0.5) * w * 0.8;
+    const ey = y0 - life * fh * 1.15;
+    g.fillStyle = "rgba(255,175,90," + ((1 - life) * 0.42).toFixed(3) + ")";
+    g.beginPath(); g.arc(ex, ey, 0.9 + (1 - life) * 1.1, 0, 6.284); g.fill();
+  }
+}
+
+function drawPerson(x, y, s, id, alpha, isMe, elapsedMin){
+  const t = serverNow();
+  const per = 3.2 + unit("p" + id) * 1.9;                            // 呼吸の周期は人ごとに違う
+  const ph  = unit("q" + id) * 6.283;
+  const br  = Math.sin((t / 1000) * (6.283 / per) + ph);
+  const bh = 46 * s, bw = 30 * s, hr = 9.5 * s;
+  const top = y - bh * (1 + br * 0.018);
+
+  g.globalAlpha = alpha;
+  if (isMe){                                                         // 自分の席は足元にうっすら光
+    const fg = g.createRadialGradient(x, y + 3, 1, x, y + 3, 26 * s);
+    fg.addColorStop(0, "rgba(255,170,90,0.20)"); fg.addColorStop(1, "rgba(255,170,90,0)");
+    g.fillStyle = fg; g.fillRect(x - 30 * s, y - 12, 60 * s, 30);
+  }
+  // 胴と頭。暗い壁に暗い体なので、輪郭で形を立てる（滲ませない）
+  const bodyPath = () => rr(x - bw / 2, top + hr * 1.5, bw, bh - hr * 1.2, bw * 0.42);
+  const headPath = () => { g.beginPath(); g.arc(x, top + hr * 0.6, hr, 0, 6.284); };
+
+  g.fillStyle = COL.body; bodyPath(); g.fill(); headPath(); g.fill();
+
+  const rim = g.createLinearGradient(0, top + bh, 0, top + bh * 0.45); // 下の火に照らされる
+  rim.addColorStop(0, "rgba(255,150,70,0.16)"); rim.addColorStop(1, "rgba(255,150,70,0)");
+  g.fillStyle = rim; bodyPath(); g.fill();
+
+  g.strokeStyle = "rgba(255,168,88,0.34)"; g.lineWidth = Math.max(1, 1.2 * s);
+  bodyPath(); g.stroke(); headPath(); g.stroke();
+
+  if (SHOW_ELAPSED && elapsedMin >= 1){                              // 記録も順位も作らない。今だけ見える
+    g.globalAlpha = alpha * 0.24;
+    g.fillStyle = COL.text; g.font = (9 * s).toFixed(1) + "px sans-serif"; g.textAlign = "center";
+    g.fillText(elapsedMin + "分", x, y + 12 * s);
+  }
+  g.globalAlpha = 1;
+}
+
+function drawSteam(now, events){
+  for (const e of events.loyly){
+    const a = now - e.t;
+    if (a < 0 || a > 7000) continue;
+    const k = a / 7000;
+    g.globalAlpha = (1 - k) * 0.30;
+    for (let i = 0; i < 16; i++){
+      const sx = W * unit("s" + e.t + i), sy = -40 + k * H * 1.15 + noise(now / 200 + i * 7) * 60;
+      const r = 30 + unit("r" + e.t + i) * 70;
+      const grd = g.createRadialGradient(sx, sy, 1, sx, sy, r);
+      grd.addColorStop(0, "rgba(255,240,225,0.5)"); grd.addColorStop(1, "rgba(255,240,225,0)");
+      g.fillStyle = grd; g.beginPath(); g.arc(sx, sy, r, 0, 6.284); g.fill();
+    }
+    g.globalAlpha = 1;
+    if (a < 800){                                                    // 一瞬白む
+      g.fillStyle = "rgba(255,244,232," + (0.42 * (1 - a / 800)).toFixed(3) + ")";
+      g.fillRect(0, 0, W, H);
+    }
+  }
+}
+
+let btn = {x:0, y:0, w:0, h:0};
+function drawHud(people, temp, now, cool, hell){
+  g.textAlign = "left"; g.fillStyle = COL.text; g.globalAlpha = 0.72;
+  g.font = "13px sans-serif";
+  g.fillText("いま " + people.length + "人", 16, 30);
+  g.textAlign = "right";
+  g.globalAlpha = hell > 0.5 ? 0.95 : 0.72;
+  g.fillStyle = hell > 0.5 ? COL.fire : COL.text;
+  g.fillText(temp.toFixed(1) + "℃", W - 16, 30);
+  g.globalAlpha = 1;
+
+  const bw = Math.min(300, W * 0.72), bh = 66;
+  btn = {x: (W - bw) / 2, y: H - bh - Math.max(26, H * 0.06), w: bw, h: bh};
+  const ready = cool <= 0;
+  g.fillStyle = ready ? "rgba(255,122,26,0.13)" : "rgba(255,255,255,0.035)";
+  rr(btn.x, btn.y, bw, bh, 10); g.fill();
+  g.strokeStyle = ready ? "rgba(255,140,50,0.75)" : "rgba(232,220,208,0.16)";
+  g.lineWidth = 1.5; rr(btn.x, btn.y, bw, bh, 10); g.stroke();
+  if (!ready){                                                        // 残り時間は細い線で
+    g.fillStyle = "rgba(255,140,50,0.30)";
+    g.fillRect(btn.x, btn.y + bh - 2.5, bw * (1 - cool / LOYLY_COOL), 2.5);
+  }
+  g.textAlign = "center"; g.font = "17px sans-serif";
+  g.fillStyle = ready ? COL.core : "rgba(232,220,208,0.32)";
+  g.fillText("ロウリュ", W / 2, btn.y + bh / 2 + 6);
+}
+
+/* ---- 本体 -------------------------------------------------------------- */
+
+const App = {
+  screen: "door",                      // door → locker（脱衣所）→ sauna
+  events: {loyly: [], door: []},
+  prev: null,                          // 直前の在室者（出入りの検出用）
+  lastLoyly: Number(localStorage.getItem("ts_loyly") || 0),
+  doorGlow: 0, seenLoyly: {},
+
+  enter(){
+    Audio_.start();
+    const open = isOpen(serverNow());
+    this.screen = open ? "sauna" : "locker";
+    Audio_.door(); this.doorGlow = 1;
+    Net.join(open ? "i" : "w");
+  },
+
+  tap(x, y){
+    if (this.screen === "door") return this.enter();
+    if (this.screen !== "sauna") return;
+    const b = btn;
+    if (x < b.x || x > b.x + b.w || y < b.y || y > b.y + b.h) return;
+    if (serverNow() - this.lastLoyly < LOYLY_COOL) return;
+    this.lastLoyly = serverNow();
+    localStorage.setItem("ts_loyly", String(this.lastLoyly));
+    Net.sendLoyly();                                                  // 押した人は送らない＝誰が押したか出ない
+  },
+
+  // 出入りとロウリュを「出来事」に変える
+  digest(people, now){
+    const ids = new Set(people.map(p => p.id));
+    if (this.prev && Net.seen){
+      let inn = 0, out = 0;
+      for (const id of ids) if (!this.prev.has(id)) inn++;
+      for (const id of this.prev) if (!ids.has(id)) out++;
+      if (inn + out > 0){
+        this.events.door.push({t: now});
+        if (this.screen === "sauna"){ Audio_.door(); this.doorGlow = 1; }
+      }
+    }
+    this.prev = ids;
+
+    for (const k in Net.loyly){
+      const e = Net.loyly[k];
+      if (!e || typeof e.t !== "number" || this.seenLoyly[k]) continue;
+      this.seenLoyly[k] = 1;
+      if (now - e.t < 6000){
+        this.events.loyly.push({t: e.t});
+        if (this.screen === "sauna") Audio_.loyly();
+      }
+    }
+    this.events.loyly = this.events.loyly.filter(e => now - e.t < 30000);
+    this.events.door  = this.events.door.filter(e => now - e.t < 9000);
+  },
+
+  // 衣擦れ。全員の端末で同じ人が同じ瞬間に動く（＝同じ部屋の音になる）
+  fidget(people, now){
+    if (this.screen !== "sauna") return;
+    const bucket = Math.floor(now / 1000);
+    for (const p of people)
+      if (hash32(p.id + ":" + bucket) % 11 === 0){ Audio_.cloth(now); break; }
+  },
+
+  frame(){
+    const now = serverNow();
+    const all = Net.present();
+    this.doorGlow = Math.max(0, this.doorGlow - 0.028);
+
+    if (this.screen === "locker" && isOpen(now)){ this.screen = "sauna"; Audio_.door(); this.doorGlow = 1; }
+    if (this.screen === "sauna" && !isOpen(now)) this.screen = "locker";
+
+    if (this.screen === "door"){ this.drawDoorScreen(now); return; }
+
+    const here = this.screen === "sauna" ? all.filter(p => p.s === "i") : all;
+    this.digest(here, now);
+    this.fidget(here, now);
+
+    if (this.screen === "locker") return this.drawLocker(all, now);
+
+    const temp = temperature(here, now, this.events);
+    const hell = LOYLY_AS_HARDSHIP ? Math.max(0, Math.min(1, (temp - 90) / 14)) : 0;
+
+    drawRoom(this.doorGlow);
+    drawStove(now, hell);
+
+    Seats.ensure(here.length);
+    Seats.assign(here);
+    for (const gh of Seats.ghosts){                                   // 席の余韻
+      const s = Seats.list[gh.seat]; if (!s) continue;
+      drawPerson(s.x, s.y, s.s, gh.id, (1 - (performance.now() - gh.t) / SEAT_FADE) * 0.5, false, 0);
+    }
+    // 奥の段から描く（手前の人が奥の人に重なるように）
+    const order = here.slice().sort((a, b) => (Seats.map[a.id] ?? 0) - (Seats.map[b.id] ?? 0));
+    for (const p of order){
+      const s = Seats.list[Seats.map[p.id]]; if (!s) continue;
+      drawPerson(s.x, s.y, s.s, p.id, 1, p.id === me, Math.floor((now - p.j) / 60000));
+    }
+
+    drawSteam(now, this.events);
+    if (hell > 0){                                                     // 熱いほど空気が歪む
+      g.globalAlpha = hell * 0.16; g.fillStyle = COL.fire;
+      const wob = Math.sin(now / 90) * 2;
+      for (let i = 0; i < 5; i++) g.fillRect(0, H * (0.3 + i * 0.14) + wob, W, 1.5);
+      g.globalAlpha = 1;
+    }
+    drawHud(here, temp, now, Math.max(0, LOYLY_COOL - (now - this.lastLoyly)), hell);
+  },
+
+  drawDoorScreen(now){
+    g.fillStyle = COL.bg; g.fillRect(0, 0, W, H);
+    const w = Math.min(190, W * 0.52), h = Math.min(300, H * 0.44);
+    const x = (W - w) / 2, y = (H - h) / 2 - 14;
+    // 隙間から漏れる光。画面全体に落とすので縁が出ない
+    const glow = g.createRadialGradient(x + w, y + h / 2, 2, x + w, y + h / 2, w * 1.5);
+    glow.addColorStop(0, "rgba(255,150,60,0.17)"); glow.addColorStop(1, "rgba(255,150,60,0)");
+    g.fillStyle = glow; g.fillRect(0, 0, W, H);
+    g.fillStyle = "#1a110c"; rr(x, y, w, h, 6); g.fill();
+    g.strokeStyle = "rgba(255,190,130,0.12)"; g.lineWidth = 1; rr(x + 9, y + 9, w - 18, h - 18, 4); g.stroke();
+    g.fillStyle = "rgba(255,190,130,0.16)";                            // 取っ手
+    rr(x + w - 20, y + h / 2 - 13, 4, 26, 2); g.fill();
+    const p = 0.5 + Math.sin(now / 900) * 0.28;                        // 光の隙間が呼吸する
+    g.fillStyle = "rgba(255,190,120," + (0.18 + p * 0.4).toFixed(3) + ")";
+    g.fillRect(x + w - 3, y + 6, 3, h - 12);
+    g.fillStyle = COL.text; g.globalAlpha = 0.5; g.textAlign = "center"; g.font = "13px sans-serif";
+    g.fillText("ふれて入る", W / 2, y + h + 40); g.globalAlpha = 1;
+  },
+
+  drawLocker(all, now){
+    const grd = g.createLinearGradient(0, 0, 0, H);
+    grd.addColorStop(0, "#0a0806"); grd.addColorStop(1, "#141010");
+    g.fillStyle = grd; g.fillRect(0, 0, W, H);
+    const by = H * 0.60;
+    g.fillStyle = COL.wood; rr(-10, by, W + 20, H * 0.03, 3); g.fill();   // 脱衣所のベンチ
+
+    const wait = all.slice(0, 9);                                         // 待っている人も描く（§5）
+    for (let i = 0; i < wait.length; i++){
+      const n = wait.length, x = n === 1 ? W / 2 : W * 0.14 + (W * 0.72) * (i / (n - 1));
+      drawPerson(x, by, 0.92, wait[i].id, 0.55, wait[i].id === me, 0);
+    }
+
+    const at = nextOpenAt(now), left = Math.max(0, at - now);
+    const mm = String(Math.floor(left / 60000)).padStart(2, "0");
+    const ss = String(Math.floor(left / 1000) % 60).padStart(2, "0");
+    g.textAlign = "center"; g.fillStyle = COL.text;
+    g.globalAlpha = 0.9;  g.font = "19px sans-serif"; g.fillText("次は " + clockLabel(at) + " に開きます", W / 2, H * 0.30);
+    g.globalAlpha = 0.55; g.font = "13px sans-serif"; g.fillText("いま " + all.length + "人が待っています", W / 2, H * 0.30 + 30);
+    g.globalAlpha = 0.32; g.font = "30px sans-serif"; g.fillText(mm + ":" + ss, W / 2, H * 0.30 + 78);
+    g.globalAlpha = 1;
+  }
+};
+
+cv.addEventListener("pointerdown", e => { e.preventDefault(); App.tap(e.clientX, e.clientY); });
+
+resize();
+(function loop(){ App.frame(); requestAnimationFrame(loop); })();
+</script>
